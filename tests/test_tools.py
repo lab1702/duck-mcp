@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
+from duckdb_mcp.config import HARD_MAX_ROWS
 from duckdb_mcp.db import ReadOnlyViolation
 from duckdb_mcp.tools import (
     ToolError,
@@ -46,6 +49,15 @@ def test_query_caps_rows_and_says_so(session, settings):
     assert "more available" in out
 
 
+def test_row_cap_never_exceeds_the_hard_maximum():
+    from duckdb_mcp.tools import _clamp_rows
+
+    assert _clamp_rows(None, 500) == 500
+    assert _clamp_rows(1_000_000, 500) == HARD_MAX_ROWS
+    assert _clamp_rows(None, 1_000_000) == HARD_MAX_ROWS  # the server default too
+    assert _clamp_rows(0, 500) == 1
+
+
 def test_query_without_cap_note_when_all_rows_fit(session, settings):
     out = run_query(session, settings, "SELECT * FROM range(3)", max_rows=10)
     assert "more available" not in out
@@ -69,24 +81,65 @@ def test_query_rejects_explain_analyze_write(session, settings, tmp_path):
     assert not target.exists()
 
 
-def test_query_caps_rows_it_cannot_push_a_limit_into(session, settings, monkeypatch):
-    """The row cap must survive the unwrappable-statement path."""
-    import duckdb
-
+def test_query_pushes_the_cap_into_duckdb(session, settings, monkeypatch):
+    """The statement runs as written, with limit+1 handed to DuckDB itself."""
     real_execute = session.execute
-    calls: list[int | None] = []
+    calls: list[tuple[str, int | None, int | None]] = []
 
     def spy(sql, **kwargs):
-        calls.append(kwargs.get("max_rows"))
-        if "_duckdb_mcp_q" in sql:
-            raise duckdb.ParserException("simulated: not valid as a subquery")
+        calls.append((sql, kwargs.get("max_rows"), kwargs.get("limit")))
         return real_execute(sql, **kwargs)
 
     monkeypatch.setattr(session, "execute", spy)
     out = run_query(session, settings, "SELECT * FROM range(100)", max_rows=5)
     assert body_rows(out) == 5
     assert "more available" in out
-    assert calls == [6, 6]  # both attempts kept the limit+1 cap
+    assert calls == [("SELECT * FROM range(100)", 6, 6)]
+
+
+def test_query_runs_explain_without_a_pushed_limit(session, settings, monkeypatch):
+    """EXPLAIN yields a plan, not a relation, so only the fetch-side cap applies."""
+    calls: list[int | None] = []
+    real_execute = session.execute
+
+    def spy(sql, **kwargs):
+        calls.append(kwargs.get("limit"))
+        return real_execute(sql, **kwargs)
+
+    monkeypatch.setattr(session, "execute", spy)
+    run_query(session, settings, "EXPLAIN SELECT 1", max_rows=5)
+    assert calls == [None]
+
+
+def test_query_keeps_duplicate_column_names(session, settings):
+    """Capping must not rename columns the way a subquery wrap would."""
+    out = run_query(session, settings, "SELECT 1 AS a, 2 AS a")
+    assert out.splitlines()[0] == "| a | a |"
+
+
+def test_query_respects_a_statements_own_limit(session, settings):
+    out = run_query(session, settings, "SELECT * FROM range(100) LIMIT 3", max_rows=50)
+    assert body_rows(out) == 3
+    assert "more available" not in out
+
+
+@pytest.mark.parametrize(
+    "sql", ["DESCRIBE SELECT 1 AS a", "SUMMARIZE SELECT 1 AS a", "SHOW TABLES", "VALUES (1),(2)"]
+)
+def test_query_handles_statements_invalid_as_a_subquery(session, settings, sql):
+    run_query(session, settings, sql)
+
+
+def test_query_reports_a_timeout_as_a_tool_error(settings):
+    """A timeout is a user-facing outcome, so it arrives as a ToolError."""
+    from duckdb_mcp.db import DuckDBSession
+
+    db = DuckDBSession(default_timeout=0.3, setup=False)
+    try:
+        with pytest.raises(ToolError, match="time limit"):
+            run_query(db, settings, "SELECT count(*) FROM range(200000000000)")
+    finally:
+        db.close()
 
 
 def test_query_surfaces_sql_errors(session, settings):
@@ -175,6 +228,35 @@ def test_list_files_uses_forward_slashes(session, settings, data_dir):
 
 def test_list_files_reports_empty(session, settings, tmp_path):
     assert "No matching files" in list_files(session, settings, tmp_path.as_posix())
+
+
+def test_list_files_stats_only_the_rows_it_renders(session, settings, tmp_path, monkeypatch):
+    """Listing a huge directory must not cost one syscall per file."""
+    for i in range(40):
+        (tmp_path / f"f{i:03d}.csv").write_text("a\n1\n", encoding="utf-8")
+
+    stats: list[str] = []
+    real_stat = os.stat
+    monkeypatch.setattr(os, "stat", lambda p, *a, **k: (stats.append(p), real_stat(p))[1])
+
+    settings.max_rows = 5
+    out = list_files(session, settings, tmp_path.as_posix())
+    assert len(stats) == 5
+    assert "40 file(s)" in out
+    assert "showing 5 of 40 rows" in out
+
+
+def test_list_files_does_not_double_the_root_separator(session, settings, monkeypatch):
+    seen: list[str] = []
+    real_execute = session.execute
+
+    def spy(sql, **kwargs):
+        seen.append(sql)
+        return real_execute(sql, **kwargs)
+
+    monkeypatch.setattr(session, "execute", spy)
+    list_files(session, settings, "/")
+    assert "'/*'" in seen[0] and "'//*'" not in seen[0]
 
 
 def test_profile_columns(session, settings, sales):

@@ -10,7 +10,7 @@ import anyio.to_thread
 from mcp.server.mcpserver import MCPServer
 
 from . import __version__, tools
-from .config import Settings
+from .config import HARD_MAX_ROWS, Settings
 from .db import DuckDBSession, log
 
 INSTRUCTIONS = """\
@@ -38,7 +38,9 @@ def get_session() -> DuckDBSession:
     """Create the shared in-memory DuckDB instance on first use."""
     global _session
     if _session is None:
-        _session = DuckDBSession(default_timeout=settings.timeout_seconds)
+        _session = DuckDBSession(
+            default_timeout=settings.timeout_seconds, memory_limit=settings.memory_limit
+        )
         log(f"duckdb-mcp {__version__} ready; extensions: {_session.capabilities}")
     return _session
 
@@ -128,6 +130,27 @@ async def profile_columns(
     return await _call(tools.profile_columns, get_session(), settings, path, columns, top_k)
 
 
+def _positive_int(text: str) -> int:
+    """An argparse type that rejects what would otherwise break every query."""
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not an integer") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"{text!r} must be 1 or greater")
+    return value
+
+
+def _non_negative_float(text: str) -> float:
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a number") from None
+    if value < 0:
+        raise argparse.ArgumentTypeError(f"{text!r} must not be negative (0 means no limit)")
+    return value
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="duckdb-mcp",
@@ -135,19 +158,28 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--version", action="version", version=f"duckdb-mcp {__version__}")
     parser.add_argument(
-        "--max-rows", type=int, default=None, help="Default row cap per query (env DUCKDB_MCP_MAX_ROWS)."
+        "--max-rows",
+        type=_positive_int,
+        default=None,
+        help=f"Default row cap per query, at most {HARD_MAX_ROWS} (env DUCKDB_MCP_MAX_ROWS).",
     )
     parser.add_argument(
         "--timeout",
-        type=float,
+        type=_non_negative_float,
         default=None,
-        help="Seconds before a query is cancelled (env DUCKDB_MCP_TIMEOUT).",
+        help="Seconds before a query is cancelled, 0 for no limit (env DUCKDB_MCP_TIMEOUT).",
     )
     parser.add_argument(
         "--max-bytes",
-        type=int,
+        type=_positive_int,
         default=None,
         help="Approximate cap on result text size (env DUCKDB_MCP_MAX_BYTES).",
+    )
+    parser.add_argument(
+        "--memory-limit",
+        type=str,
+        default=None,
+        help="Override DuckDB's memory ceiling, e.g. '4GB' (env DUCKDB_MCP_MEMORY_LIMIT).",
     )
     return parser
 
@@ -160,6 +192,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         settings.timeout_seconds = args.timeout
     if args.max_bytes is not None:
         settings.max_bytes = args.max_bytes
+    if args.memory_limit is not None:
+        settings.memory_limit = args.memory_limit
     mcp.run(transport="stdio")
 
 

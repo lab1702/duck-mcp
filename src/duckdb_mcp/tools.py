@@ -9,10 +9,11 @@ from typing import Any, Sequence
 
 import duckdb
 
-from .config import Settings
+from .config import HARD_MAX_ROWS, Settings
 from .db import (
     READABLE_EXTS,
     DuckDBSession,
+    QueryTimeout,
     TimeBudget,
     assert_read_only,
     format_duckdb_error,
@@ -22,7 +23,6 @@ from .db import (
 )
 from .formatting import format_cell, render_result, to_markdown_table, truncation_note
 
-HARD_MAX_ROWS = 10_000
 PROFILE_MAX_COLUMNS = 60
 PROFILE_TOP_VALUE_COLUMNS = 20
 PROFILE_TOP_VALUE_DISTINCT_LIMIT = 50
@@ -35,9 +35,8 @@ class ToolError(RuntimeError):
 
 
 def _clamp_rows(requested: int | None, default: int) -> int:
-    if requested is None:
-        return default
-    return max(1, min(int(requested), HARD_MAX_ROWS))
+    """Hold any row cap to ``1..HARD_MAX_ROWS`` -- the server's default included."""
+    return max(1, min(int(default if requested is None else requested), HARD_MAX_ROWS))
 
 
 def _is_data_file(name: str) -> bool:
@@ -62,6 +61,7 @@ def _run(
     read_only: bool = False,
     budget: TimeBudget | None = None,
     max_rows: int | None = None,
+    limit: int | None = None,
 ):
     try:
         return session.execute(
@@ -69,8 +69,11 @@ def _run(
             read_only=read_only,
             timeout=None if budget is None else budget.remaining(),
             max_rows=max_rows,
+            limit=limit,
         )
-    except duckdb.Error as exc:
+    except (duckdb.Error, QueryTimeout) as exc:
+        # A timeout is a user-facing outcome like any query error, so it leaves
+        # here as a ToolError rather than as a bare RuntimeError.
         raise ToolError(format_duckdb_error(exc)) from exc
 
 
@@ -99,31 +102,20 @@ def run_query(
     max_rows: int | None = None,
 ) -> str:
     limit = _clamp_rows(max_rows, settings.max_rows)
-    # Validate the statement the caller actually wrote, before it is wrapped.
     kind = assert_read_only(session.connection, sql)
     budget = session.budget()
 
     inner = sql.strip().rstrip(";").strip()
-    if kind == "EXPLAIN":
-        # EXPLAIN is not a valid subquery, so it runs as written and the cap is
-        # applied while fetching instead.
-        columns, rows = _run(session, inner, budget=budget, max_rows=limit + 1)
-    else:
-        # Fetching limit+1 rows tells us whether more exist without counting
-        # them, and pushes the cap down into DuckDB rather than into Python.
-        wrapped = f"SELECT * FROM (\n{inner}\n) AS _duckdb_mcp_q LIMIT {limit + 1}"
-        try:
-            columns, rows = session.execute(
-                wrapped, read_only=False, timeout=budget.remaining(), max_rows=limit + 1
-            )
-        except duckdb.ParserException:
-            # Valid on its own but not as a subquery. Only parse errors get a
-            # retry: a statement that failed while running has already scanned
-            # its input once, and running it again would just pay that cost
-            # twice before surfacing the same error.
-            columns, rows = _run(session, inner, budget=budget, max_rows=limit + 1)
-        except duckdb.Error as exc:
-            raise ToolError(format_duckdb_error(exc)) from exc
+    # Asking for limit+1 rows tells us whether more exist without counting them.
+    # EXPLAIN produces a plan rather than a relation, so only the fetch-side cap
+    # applies to it; everything else also gets the cap pushed into DuckDB.
+    columns, rows = _run(
+        session,
+        inner,
+        budget=budget,
+        max_rows=limit + 1,
+        limit=None if kind == "EXPLAIN" else limit + 1,
+    )
 
     return render_result(
         columns,
@@ -206,10 +198,10 @@ def list_files(
     recursive: bool = False,
     data_files_only: bool = True,
 ) -> str:
-    base = (path or ".").replace("\\", "/").rstrip("/")
-    if not base:
-        base = "/"
-    glob_pattern = f"{base}/**/{pattern}" if recursive else f"{base}/{pattern}"
+    base = (path or ".").replace("\\", "/").rstrip("/") or "/"
+    # Keep exactly one separator, so a filesystem root does not become '//*'.
+    prefix = base if base.endswith("/") else base + "/"
+    glob_pattern = f"{prefix}**/{pattern}" if recursive else f"{prefix}{pattern}"
     _, rows = _run(session, f"SELECT file FROM glob({sql_string(glob_pattern)}) ORDER BY file")
     # glob() hands back native separators on Windows; forward slashes are what the
     # caller will paste back into a query.
@@ -218,11 +210,16 @@ def list_files(
     if data_files_only:
         files = [f for f in files if _is_data_file(f)]
 
-    if not files:
+    total = len(files)
+    if not total:
         return f"No matching files under {glob_pattern}"
 
+    # Stat only the rows that will be rendered. A directory holding a hundred
+    # thousand files should not cost a hundred thousand syscalls to show the
+    # first few hundred of them.
+    shown = _clamp_rows(None, settings.max_rows)
     table_rows: list[tuple[Any, ...]] = []
-    for name in files:
+    for name in files[:shown]:
         size = ""
         modified = ""
         if "://" not in name:
@@ -237,9 +234,10 @@ def list_files(
     return render_result(
         ["file", "size_bytes", "modified"],
         table_rows,
-        max_rows=settings.max_rows,
+        max_rows=shown,
         max_bytes=settings.max_bytes,
-        header=f"**{glob_pattern}** — {len(files)} file(s)",
+        total_rows=total,
+        header=f"**{glob_pattern}** — {total} file(s)",
     )
 
 

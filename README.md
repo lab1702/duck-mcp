@@ -11,6 +11,12 @@ before they reach DuckDB, so no tool call can modify data, write files or
 change server state. `EXPLAIN ANALYZE` is rejected too, because it runs the
 statement it wraps.
 
+Read-only is not the same as sandboxed. The server can read anything the user
+account running it can read — `SELECT * FROM read_text('~/.aws/credentials')`
+is a legitimate read — and it can fetch any URL. Run it as a user whose file
+access you are happy to expose, and treat the contents of the files it reads as
+untrusted input to whatever model is driving it.
+
 ## Install
 
 The only thing to install is [uv](https://docs.astral.sh/uv/). Everything else
@@ -111,12 +117,26 @@ Defaults, all overridable:
 | Rows per result | 500 | `DUCKDB_MCP_MAX_ROWS` | `--max-rows` |
 | Query timeout | 120s | `DUCKDB_MCP_TIMEOUT` | `--timeout` |
 | Result text size | 200 KB | `DUCKDB_MCP_MAX_BYTES` | `--max-bytes` |
+| Memory ceiling | DuckDB's own | `DUCKDB_MCP_MEMORY_LIMIT` | `--memory-limit` |
 
 Truncated results say so explicitly, e.g. `(showing first 500 rows (more
 available))`, including when a schema or profile table is cut short by the
 size cap. The timeout covers a whole tool call, not each statement in it, so
 a tool that runs several queries still finishes within it; a call that
 overruns is cancelled and reported.
+
+No row cap goes above 10,000, however it is set. A timeout of `0` means no
+time limit.
+
+The memory ceiling is left to DuckDB by default, which sizes it against system
+memory — the right answer for the single instance this server runs. Setting it
+is for the case DuckDB cannot see: MCP starts one server process per client, so
+several concurrent sessions mean several DuckDB instances on one machine, each
+holding its own independent ceiling. `--memory-limit` takes a size with a unit
+(`4GB`, `512MB`); percentages are not accepted.
+
+Unusable values are not silently accepted: a bad flag is a startup error, and
+a bad environment variable is ignored with a line on stderr.
 
 ```json
 {

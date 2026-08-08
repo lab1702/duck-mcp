@@ -88,6 +88,33 @@ def test_read_only_allows_explain_options_without_analyze(session):
     assert assert_read_only(session.connection, "EXPLAIN (FORMAT json) SELECT 1") == "EXPLAIN"
 
 
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "/* plan this */ EXPLAIN SELECT 1",
+        "-- plan this\nEXPLAIN SELECT 1",
+        "/* outer /* nested */ still a comment */ EXPLAIN SELECT 1",
+        "  -- one\n  /* two */\n  EXPLAIN SELECT 1",
+    ],
+)
+def test_read_only_allows_explain_behind_a_comment(session, sql):
+    """A model may well open its SQL with a comment; that is still read-only."""
+    assert assert_read_only(session.connection, sql) == "EXPLAIN"
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "/* sneaky */ EXPLAIN ANALYZE COPY (SELECT 1 AS x) TO 'pwned.csv'",
+        "-- sneaky\nEXPLAIN ANALYZE CREATE TABLE evil AS SELECT 42",
+        "/* sneaky */ EXPLAIN COPY (SELECT 1 AS x) TO 'pwned.csv'",
+    ],
+)
+def test_comments_do_not_smuggle_a_write_past_the_explain_check(session, sql):
+    with pytest.raises(ReadOnlyViolation):
+        assert_read_only(session.connection, sql)
+
+
 def test_assert_read_only_returns_the_kind(session):
     assert assert_read_only(session.connection, "SELECT 1") == "SELECT"
 
@@ -168,6 +195,47 @@ def test_timeout_cancels_long_query():
             db.execute("SELECT count(*) FROM range(200000000000)")
     finally:
         db.close()
+
+
+def test_no_memory_limit_is_set_by_default():
+    """DuckDB's own per-instance limit is right for the one instance we run."""
+    db = DuckDBSession(default_timeout=30.0, setup=False)
+    try:
+        assert "memory_limit" not in db.capabilities
+    finally:
+        db.close()
+
+
+def test_memory_limit_is_applied_when_asked_for():
+    """For the multi-process case: several servers, each with its own ceiling."""
+    db = DuckDBSession(default_timeout=30.0, memory_limit="512MB", setup=False)
+    try:
+        assert db.capabilities["memory_limit"] == "ok"
+        _, rows = db.execute("SELECT current_setting('memory_limit')")
+        assert rows[0][0] == "488.2 MiB"  # 512MB is 512 * 1000^2, reported back in MiB
+    finally:
+        db.close()
+
+
+def test_bad_memory_limit_is_reported_not_fatal():
+    db = DuckDBSession(default_timeout=30.0, memory_limit="not-a-size", setup=False)
+    try:
+        assert db.capabilities["memory_limit"].startswith("unavailable")
+        assert db.execute("SELECT 1")[1] == [(1,)]
+    finally:
+        db.close()
+
+
+def test_execute_pushes_a_limit_without_renaming_columns(session):
+    columns, rows = session.execute("SELECT 1 AS a, 2 AS a", limit=5)
+    assert columns == ["a", "a"]
+    assert rows == [(1, 2)]
+
+
+def test_execute_limit_streams(session):
+    # Pushed into DuckDB, so this returns at once rather than building 10^9 rows.
+    _, rows = session.execute("SELECT i FROM range(1000000000) t(i)", limit=3, timeout=10)
+    assert rows == [(0,), (1,), (2,)]
 
 
 def test_quoting_escapes_delimiters():

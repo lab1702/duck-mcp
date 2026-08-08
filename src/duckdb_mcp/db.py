@@ -99,11 +99,43 @@ def source_expr(path: str) -> str:
     return literal
 
 
+def _strip_leading_comments(sql: str) -> str:
+    """Drop leading whitespace and SQL comments.
+
+    The checks below anchor on the first keyword, and a statement may
+    legitimately open with a comment -- models write them. Block comments nest
+    in DuckDB, so this counts depth rather than scanning for the first ``*/``.
+    """
+    pos, length = 0, len(sql)
+    while pos < length:
+        if sql[pos].isspace():
+            pos += 1
+        elif sql.startswith("--", pos):
+            newline = sql.find("\n", pos)
+            pos = length if newline == -1 else newline + 1
+        elif sql.startswith("/*", pos):
+            depth, scan = 1, pos + 2
+            while scan < length and depth:
+                if sql.startswith("/*", scan):
+                    depth, scan = depth + 1, scan + 2
+                elif sql.startswith("*/", scan):
+                    depth, scan = depth - 1, scan + 2
+                else:
+                    scan += 1
+            if depth:
+                # Unterminated: hand it back untouched and let the parser object.
+                return sql[pos:]
+            pos = scan
+        else:
+            break
+    return sql[pos:]
+
+
 def statement_kinds(con: duckdb.DuckDBPyConnection, sql: str) -> list[str]:
     """Return the DuckDB statement kind of each statement in ``sql``."""
     extract = getattr(con, "extract_statements", None)
     if extract is None:  # pragma: no cover - depends on DuckDB version
-        keyword = _LEADING_KEYWORD.match(sql)
+        keyword = _LEADING_KEYWORD.match(_strip_leading_comments(sql))
         word = keyword.group(1).lower() if keyword else ""
         if word == "explain":
             return ["EXPLAIN"]
@@ -152,8 +184,12 @@ def _assert_explain_read_only(con: duckdb.DuckDBPyConnection, sql: str) -> None:
     would write a file. Plain EXPLAIN only plans, but a write there is a
     mistake either way, so both are rejected.
     """
-    match = _EXPLAIN_PREFIX.match(sql)
-    if match is None:  # pragma: no cover - the parser already said this is EXPLAIN
+    body = _strip_leading_comments(sql)
+    match = _EXPLAIN_PREFIX.match(body)
+    if match is None:
+        # The parser already called this an EXPLAIN, so the only way here is
+        # text the comment stripper could not get past -- an unterminated block
+        # comment, say. Refuse rather than guess at what would run.
         raise ReadOnlyViolation("Could not determine what this EXPLAIN wraps; refusing to run it.")
     options, analyze = match.group(1), match.group(2)
     if analyze or (options and re.search(r"\bANALYZE\b", options, re.IGNORECASE)):
@@ -161,7 +197,7 @@ def _assert_explain_read_only(con: duckdb.DuckDBPyConnection, sql: str) -> None:
             "EXPLAIN ANALYZE executes the statement it wraps, so it is not read-only. "
             "Use plain EXPLAIN for the query plan."
         )
-    inner = sql[match.end() :].strip().rstrip(";").strip()
+    inner = body[match.end() :].strip().rstrip(";").strip()
     if not inner:
         raise ReadOnlyViolation("EXPLAIN needs a statement to explain.")
     assert_read_only(con, inner, _depth=1)
@@ -195,10 +231,23 @@ class DuckDBSession:
     trample each other, and so a timeout can interrupt one call in isolation.
     """
 
-    def __init__(self, *, default_timeout: float = 120.0, setup: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        default_timeout: float = 120.0,
+        memory_limit: str | None = None,
+        setup: bool = True,
+    ) -> None:
         self._con = duckdb.connect(":memory:")
         self.default_timeout = default_timeout
         self.capabilities: dict[str, str] = {}
+        if memory_limit:
+            # Left alone, DuckDB sizes this against system RAM, which is right
+            # for the one instance this server runs. Overriding it is for the
+            # case DuckDB cannot see: several server processes on one machine,
+            # each with its own independent ceiling. Not part of _configure,
+            # because extensions are best-effort and a stated limit is not.
+            self._try("memory_limit", [f"SET memory_limit={sql_string(memory_limit)}"])
         if setup:
             self._configure()
 
@@ -247,16 +296,25 @@ class DuckDBSession:
         timeout: float | None = None,
         read_only: bool = True,
         max_rows: int | None = None,
+        limit: int | None = None,
     ) -> tuple[list[str], list[tuple[Any, ...]]]:
         """Run ``sql`` and return ``(column_names, rows)``.
 
         ``max_rows`` caps how many rows are pulled into Python. DuckDB streams
         the result, so this keeps an unbounded ``SELECT *`` from materialising
         even when no LIMIT could be pushed into the statement itself.
+
+        ``limit`` additionally pushes the cap into DuckDB, so the optimizer can
+        turn an ``ORDER BY`` into a top-N and skip parquet row groups. It goes
+        through the relational API rather than wrapping the statement in
+        ``SELECT * FROM (...)``: wrapping makes a subquery, and a subquery's
+        output names must be unique, so ``SELECT 1 AS a, 2 AS a`` would come
+        back as ``a, a_1``. It also keeps DESCRIBE / SUMMARIZE / SHOW working,
+        which are not valid in a subquery position.
         """
         if read_only:
             assert_read_only(self._con, sql)
-        limit = self.default_timeout if timeout is None else timeout
+        time_limit = self.default_timeout if timeout is None else timeout
         cursor = self._con.cursor()
         interrupted = threading.Event()
 
@@ -267,19 +325,26 @@ class DuckDBSession:
             except Exception:  # pragma: no cover - cursor already finished
                 pass
 
-        timer = threading.Timer(limit, _interrupt) if limit and limit > 0 else None
+        timer = threading.Timer(time_limit, _interrupt) if time_limit and time_limit > 0 else None
         try:
             if timer is not None:
                 timer.daemon = True
                 timer.start()
-            result = cursor.execute(sql)
-            columns = [d[0] for d in result.description] if result.description else []
+            if limit is None:
+                result = cursor.execute(sql)
+                columns = [d[0] for d in result.description] if result.description else []
+            else:
+                relation = cursor.sql(sql)
+                if relation is None:  # pragma: no cover - callers validate first
+                    raise ValueError("Statement returned no result to limit.")
+                result = relation.limit(limit)
+                columns = list(result.columns)
             rows = result.fetchall() if max_rows is None else result.fetchmany(max_rows)
             return columns, rows
         except duckdb.Error as exc:
             if interrupted.is_set():
                 raise QueryTimeout(
-                    f"Query exceeded the {limit:g}s time limit and was cancelled."
+                    f"Query exceeded the {time_limit:g}s time limit and was cancelled."
                 ) from exc
             raise
         finally:
@@ -288,8 +353,8 @@ class DuckDBSession:
             cursor.close()
 
 
-def format_duckdb_error(exc: duckdb.Error) -> str:
-    """Flatten a DuckDB error into a single readable line."""
+def format_duckdb_error(exc: Exception) -> str:
+    """Flatten a DuckDB error (or a QueryTimeout) into a single readable line."""
     text = str(exc).strip()
     return " ".join(text.split())
 
