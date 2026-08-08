@@ -39,9 +39,22 @@ _COMPRESSION_SUFFIXES = (".gz", ".zst", ".bz2", ".br")
 CSV_EXTS = {".csv", ".tsv", ".tab", ".txt"}
 JSON_EXTS = {".json", ".ndjson", ".jsonl"}
 PARQUET_EXTS = {".parquet", ".pq"}
-_EXCEL_EXTS = {".xlsx", ".xlsm", ".xls"}
+EXCEL_EXTS = {".xlsx", ".xlsm", ".xls"}
 
-READABLE_EXTS = CSV_EXTS | JSON_EXTS | PARQUET_EXTS | _EXCEL_EXTS
+READABLE_EXTS = CSV_EXTS | JSON_EXTS | PARQUET_EXTS | EXCEL_EXTS
+
+# Path prefixes that only work once httpfs is loaded.
+REMOTE_SCHEMES = (
+    "s3://", "gs://", "gcs://", "r2://", "az://", "azure://", "abfss://", "http://", "https://",
+)
+
+# Signs that a remote read was refused rather than merely missing. DuckDB
+# rewrites s3:// to the bucket's https:// form before reporting, so the scheme
+# has to be recognised in the statement rather than in the message.
+_AUTH_SIGNALS = (
+    "403", "401", "accessdenied", "unauthorized", "signaturedoesnotmatch",
+    "invalidaccesskeyid", "credential",
+)
 
 # The reader that takes multi-file options such as union_by_name, per format.
 MULTI_FILE_READERS = (
@@ -52,7 +65,7 @@ MULTI_FILE_READERS = (
 
 # Container formats: readable, but not as lines of text. A raw peek at one
 # gets a CSV-parser error rather than anything useful, so callers refuse early.
-BINARY_EXTS = PARQUET_EXTS | _EXCEL_EXTS
+BINARY_EXTS = PARQUET_EXTS | EXCEL_EXTS
 
 # Formats known not to be parquet. An unrecognised extension is not on this
 # list: parquet turns up under .parq, .snappy and no extension at all, so those
@@ -104,7 +117,7 @@ def source_expr(path: str) -> str:
         raise ValueError("path must not be empty")
     literal = sql_string(path)
     ext = extension_of(path)
-    if ext in _EXCEL_EXTS:
+    if ext in EXCEL_EXTS:
         return f"read_xlsx({literal})"
     if ext in {".tsv", ".tab", ".txt"}:
         return f"read_csv({literal})"
@@ -373,6 +386,46 @@ def format_duckdb_error(exc: Exception) -> str:
     """Flatten a DuckDB error (or a QueryTimeout) into a single readable line."""
     text = str(exc).strip()
     return " ".join(text.split())
+
+
+def capability_hint(capabilities: dict[str, str], sql: str, message: str) -> str | None:
+    """Explain a failure that something missing at startup is responsible for.
+
+    Extensions and credentials are set up once, when the server starts, and a
+    machine that was offline or unconfigured then produces read errors later
+    that say nothing about the real cause. The startup outcome is recorded in
+    ``DuckDBSession.capabilities``; this is where it gets used.
+    """
+    lowered = sql.lower()
+
+    if any(scheme in lowered for scheme in REMOTE_SCHEMES):
+        state = capabilities.get("httpfs", "not attempted")
+        if state != "ok":
+            return (
+                f"The httpfs extension is not available ({state}), and remote paths need "
+                "it. It is installed when the server starts and needs network access at "
+                "that moment, so restart the server once it has some."
+            )
+
+    if any(ext in lowered for ext in EXCEL_EXTS):
+        state = capabilities.get("excel", "not attempted")
+        if state != "ok":
+            return (
+                f"The excel extension is not available ({state}), and .xlsx workbooks need "
+                "it. It is installed at startup; restart the server with network access. "
+                "Exporting the sheet to CSV also works."
+            )
+
+    if "s3://" in lowered and any(signal in message.lower() for signal in _AUTH_SIGNALS):
+        state = capabilities.get("s3_credential_chain", "not attempted")
+        if state != "ok":
+            return (
+                f"No AWS credentials were resolved when the server started ({state}), so "
+                "this bucket is being read anonymously — which is what a 403 here usually "
+                "means. DuckDB resolves credentials once at startup, so setting them now "
+                "requires a restart."
+            )
+    return None
 
 
 def log(message: str) -> None:

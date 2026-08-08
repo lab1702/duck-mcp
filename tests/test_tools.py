@@ -154,6 +154,41 @@ def test_query_surfaces_sql_errors(session, settings):
         run_query(session, settings, "SELECT * FROM nope_missing_table")
 
 
+def test_errors_carry_a_capability_hint(session, settings, monkeypatch):
+    """A remote read failing on a server whose httpfs never loaded should say so.
+
+    Every tool's failures funnel through the same place, so `query` gets this
+    too -- which matters, since that is where a pasted s3:// URL arrives.
+    """
+    import duckdb
+
+    monkeypatch.setitem(session.capabilities, "httpfs", "unavailable: offline")
+
+    def boom(sql, **kwargs):
+        raise duckdb.IOException("IO Error: could not fetch")
+
+    monkeypatch.setattr(session, "execute", boom)
+    with pytest.raises(ToolError) as excinfo:
+        run_query(session, settings, "SELECT * FROM 'https://example.com/a.csv'")
+
+    message = str(excinfo.value)
+    assert "could not fetch" in message  # DuckDB's own error is kept
+    assert "httpfs extension is not available" in message
+    assert "offline" in message
+
+
+def test_errors_without_a_capability_problem_are_unchanged(session, settings, monkeypatch):
+    import duckdb
+
+    def boom(sql, **kwargs):
+        raise duckdb.IOException("IO Error: could not fetch")
+
+    monkeypatch.setattr(session, "execute", boom)
+    with pytest.raises(ToolError) as excinfo:
+        run_query(session, settings, "SELECT * FROM 'local.csv'")
+    assert str(excinfo.value) == "IO Error: could not fetch"
+
+
 def test_describe_file(session, settings, sales):
     out = describe_file(session, settings, sales)
     assert "4 columns" in out

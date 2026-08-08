@@ -13,6 +13,7 @@ from duckdb_mcp.db import (
     ReadOnlyViolation,
     TimeBudget,
     assert_read_only,
+    capability_hint,
     quote_ident,
     source_expr,
     sql_string,
@@ -263,3 +264,47 @@ def test_source_expr(path, expected):
 def test_source_expr_rejects_empty():
     with pytest.raises(ValueError):
         source_expr("   ")
+
+
+# What the server managed to set up at startup, in the three states that matter.
+ALL_OK = {"httpfs": "ok", "excel": "ok", "s3_credential_chain": "ok"}
+NO_CREDENTIALS = {"httpfs": "ok", "excel": "ok", "s3_credential_chain": "unavailable: no chain"}
+NO_HTTPFS = {"httpfs": "unavailable: offline", "excel": "ok"}
+
+
+@pytest.mark.parametrize(
+    ("capabilities", "sql", "message", "expected"),
+    [
+        (NO_HTTPFS, "SELECT * FROM 'https://h/x.csv'", "HTTP error", "httpfs"),
+        (NO_HTTPFS, "SELECT * FROM 's3://b/k.parquet'", "HTTP error", "httpfs"),
+        ({}, "SELECT * FROM 's3://b/k.parquet'", "HTTP 403", "httpfs"),
+        ({"excel": "unavailable: offline"}, "read_xlsx('b.xlsx')", "IO Error", "excel"),
+        (NO_CREDENTIALS, "SELECT * FROM 's3://b/k.parquet'", "HTTP 403 AccessDenied", "AWS"),
+    ],
+)
+def test_capability_hint_explains_a_startup_failure(capabilities, sql, message, expected):
+    hint = capability_hint(capabilities, sql, message)
+    assert hint is not None and expected in hint
+
+
+@pytest.mark.parametrize(
+    ("capabilities", "sql", "message"),
+    [
+        # Everything loaded, so the failure is about the data, not the setup.
+        (ALL_OK, "SELECT * FROM 'https://h/x.csv'", "HTTP 404 Not Found"),
+        (ALL_OK, "SELECT * FROM 's3://b/k.parquet'", "HTTP 403 AccessDenied"),
+        # Missing rather than refused: credentials would not have helped.
+        (NO_CREDENTIALS, "SELECT * FROM 's3://b/k.parquet'", "HTTP 404 Not Found"),
+        # A local read cannot be httpfs's fault however broken httpfs is.
+        (NO_HTTPFS, "SELECT * FROM 'a.csv'", "IO Error: no such file"),
+    ],
+)
+def test_capability_hint_stays_quiet_otherwise(capabilities, sql, message):
+    assert capability_hint(capabilities, sql, message) is None
+
+
+def test_capability_hint_names_the_startup_reason():
+    """The recorded reason is the part DuckDB's own error cannot know."""
+    hint = capability_hint(NO_HTTPFS, "SELECT * FROM 'https://h/x.csv'", "HTTP error")
+    assert "offline" in hint
+    assert "restart" in hint

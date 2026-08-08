@@ -312,6 +312,25 @@ work. Likewise, if the machine is offline at startup, extension setup is skipped
 and local files still work. The server writes a line to stderr on startup
 reporting which of `httpfs`, `excel` and the S3 credential chain came up.
 
+Because all of that happens at startup, a read that fails later says nothing
+about the real cause. So when something set up at startup is missing, the error
+carries the reason with it:
+
+```
+HTTP Error: HTTP GET error reading 'https://bucket.s3.amazonaws.com/data.parquet'
+in region '' (HTTP 403 Forbidden) AccessDenied: Access Denied
+
+No AWS credentials were resolved when the server started (unavailable: Secret
+Validation Failure: ... Credential Chain: 'config'), so this bucket is being read
+anonymously — which is what a 403 here usually means. DuckDB resolves credentials
+once at startup, so setting them now requires a restart.
+```
+
+The same applies to an `https://` or `s3://` path when `httpfs` failed to
+install, and to `.xlsx` when `excel` did. The hint is added only when the
+capability is actually missing *and* the failure is the kind it would explain —
+a 404 on S3 is a missing object, not a credentials problem, and gets no hint.
+
 ## Limits
 
 Defaults, all overridable:

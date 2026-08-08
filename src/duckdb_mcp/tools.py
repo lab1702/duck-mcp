@@ -21,6 +21,7 @@ from .db import (
     QueryTimeout,
     TimeBudget,
     assert_read_only,
+    capability_hint,
     extension_of,
     format_duckdb_error,
     quote_ident,
@@ -117,7 +118,11 @@ def _run(
     except (duckdb.Error, QueryTimeout) as exc:
         # A timeout is a user-facing outcome like any query error, so it leaves
         # here as a ToolError rather than as a bare RuntimeError.
-        raise ToolError(format_duckdb_error(exc)) from exc
+        text = format_duckdb_error(exc)
+        # Every tool's failures come through here, `query` included, so this is
+        # the one place a startup problem can be attached to the read it broke.
+        hint = capability_hint(session.capabilities, sql, text)
+        raise ToolError(f"{text}\n\n{hint}" if hint else text) from exc
 
 
 def _describe(
