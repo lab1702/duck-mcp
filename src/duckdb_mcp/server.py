@@ -35,6 +35,11 @@ and what the CSV sniffer made of it; the other tools cannot, because they all
 read through that same parser. For parquet, `parquet_metadata` reads the footer
 rather than the data: row counts, per-column size and compression, and whether
 a filter can skip row groups, all without a scan.
+
+Before trusting a query over a glob of many files, `compare_schemas` checks
+that they agree. Files that disagree are not reliably an error: DuckDB adopts
+the first file's schema, silently dropping a column the others add and silently
+narrowing values its types cannot hold.
 """
 
 settings = Settings.from_env()
@@ -188,6 +193,25 @@ async def parquet_metadata(path: str, row_groups: bool = False) -> str:
         row_groups: Also list each row group's row count and size.
     """
     return await _call(tools.parquet_metadata, get_session(), settings, path, row_groups)
+
+
+@mcp.tool()
+async def compare_schemas(path: str, max_files: int | None = None) -> str:
+    """Compare the schemas of the files a glob matches and report what a plain
+    read does about any differences.
+
+    Use this before trusting a query over a multi-file dataset, and whenever
+    one looks wrong -- a column that should be there is missing, or values
+    arrive rounded. DuckDB takes its schema from the first file and reconciles
+    the others against it, so a column the first file lacks is dropped and a
+    value its type cannot hold is narrowed, both without an error.
+
+    Args:
+        path: Glob matching the files to compare, e.g. 'data/*.parquet'.
+        max_files: How many files to read schemas from (default 100, spread
+            across the glob rather than taken from the front).
+    """
+    return await _call(tools.compare_schemas, get_session(), settings, path, max_files)
 
 
 def _positive_int(text: str) -> int:

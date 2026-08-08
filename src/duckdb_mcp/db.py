@@ -37,11 +37,18 @@ _MIN_TIME_SLICE = 0.001
 _COMPRESSION_SUFFIXES = (".gz", ".zst", ".bz2", ".br")
 
 CSV_EXTS = {".csv", ".tsv", ".tab", ".txt"}
-_JSON_EXTS = {".json", ".ndjson", ".jsonl"}
+JSON_EXTS = {".json", ".ndjson", ".jsonl"}
 PARQUET_EXTS = {".parquet", ".pq"}
 _EXCEL_EXTS = {".xlsx", ".xlsm", ".xls"}
 
-READABLE_EXTS = CSV_EXTS | _JSON_EXTS | PARQUET_EXTS | _EXCEL_EXTS
+READABLE_EXTS = CSV_EXTS | JSON_EXTS | PARQUET_EXTS | _EXCEL_EXTS
+
+# The reader that takes multi-file options such as union_by_name, per format.
+MULTI_FILE_READERS = (
+    [(ext, "read_csv") for ext in CSV_EXTS]
+    + [(ext, "read_json_auto") for ext in JSON_EXTS]
+    + [(ext, "read_parquet") for ext in PARQUET_EXTS]
+)
 
 # Container formats: readable, but not as lines of text. A raw peek at one
 # gets a CSV-parser error rather than anything useful, so callers refuse early.

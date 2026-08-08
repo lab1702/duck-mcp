@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import datetime as dt
 import os
+import re
 from typing import Any, Sequence
 
 import duckdb
@@ -13,6 +14,7 @@ from .config import HARD_MAX_ROWS, Settings
 from .db import (
     BINARY_EXTS,
     CSV_EXTS,
+    MULTI_FILE_READERS,
     NON_PARQUET_EXTS,
     READABLE_EXTS,
     DuckDBSession,
@@ -49,11 +51,25 @@ RAW_LINE_CHARS = 2000
 SMALL_ROW_GROUP_ROWS = 10_000
 SMALL_FILE_BYTES = 16 * 1024 * 1024
 
+# compare_schemas reads one schema per file, so its cost is linear in the file
+# count. Past this many it compares a spread instead of every file.
+COMPARE_MAX_FILES = 100
+
+# Type names are interpolated into a cast to ask DuckDB how two of them
+# reconcile, so anything that is not plainly a type name is not interpolated.
+# STRUCT(a INTEGER) and DECIMAL(10,2) pass; a quoted field name does not, and
+# is reported as unknown rather than guessed at.
+_PLAIN_TYPE = re.compile(r"^[A-Za-z0-9_(), \[\]]+$")
+
 _NESTED_TYPE_PREFIXES = ("STRUCT", "MAP", "UNION", "LIST")
 
 
 class ToolError(RuntimeError):
     """A user-facing failure; the message is returned to the model verbatim."""
+
+
+def _plural(count: int, noun: str) -> str:
+    return noun if count == 1 else noun + "s"
 
 
 def _clamp_rows(requested: int | None, default: int) -> int:
@@ -723,6 +739,256 @@ def _row_group_table(
         total_rows=len(rows),
         header="Row groups:",
     )
+
+
+# --------------------------------------------------------------------------
+# compare_schemas
+# --------------------------------------------------------------------------
+
+
+def compare_schemas(
+    session: DuckDBSession,
+    settings: Settings,
+    path: str,
+    max_files: int | None = None,
+) -> str:
+    """Compare the schemas of every file a glob matches, and say what a plain
+    read will do about the differences.
+
+    Reading a glob whose files disagree is not reliably an error. DuckDB takes
+    its schema from the first file and reconciles the rest against it, which
+    quietly drops a column the first file lacks and quietly narrows a value the
+    first file's type cannot hold. Both look like ordinary results.
+    """
+    budget = session.budget()
+    _, listed = _run(
+        session, f"SELECT file FROM glob({sql_string(path)}) ORDER BY file", budget=budget
+    )
+    files = [str(row[0]).replace("\\", "/") for row in listed]
+    if not files:
+        raise ToolError(f"No files matched {path}.")
+    if len(files) == 1:
+        return (
+            f"**{path}** — matched one file, so there is nothing to compare.\n\n"
+            + describe_file(session, settings, files[0], include_row_count=False)
+        )
+
+    limit = max(2, min(int(max_files or COMPARE_MAX_FILES), COMPARE_MAX_FILES))
+    chosen = _spread(files, limit)
+
+    schemas: dict[str, list[tuple[str, str]]] = {}
+    unreadable: list[str] = []
+    for name in chosen:
+        try:
+            described = _describe(session, source_expr(name), budget=budget)
+        except ToolError:
+            # One corrupt or empty file must not sink the comparison; it is
+            # reported alongside the rest, which is itself a useful finding.
+            unreadable.append(name)
+            continue
+        schemas[name] = [(col, ctype) for col, ctype, _ in described]
+    if not schemas:
+        raise ToolError(f"None of the {len(chosen)} files matching {path} could be read.")
+
+    reference = chosen[0] if chosen[0] in schemas else next(iter(schemas))
+    ref_types = dict(schemas[reference])
+    signatures = {tuple(cols) for cols in schemas.values()}
+
+    # Column order follows the reference file, then first appearance elsewhere,
+    # so the table reads like the schema a query would actually see.
+    order: list[str] = [name for name, _ in schemas[reference]]
+    for cols in schemas.values():
+        for name, _ in cols:
+            if name not in order:
+                order.append(name)
+
+    records: list[list[Any]] = []
+    drops: list[str] = []
+    failures: list[str] = []
+    narrowings: list[str] = []
+    for column in order:
+        seen: dict[str, int] = {}
+        for cols in schemas.values():
+            for name, ctype in cols:
+                if name == column:
+                    seen[ctype] = seen.get(ctype, 0) + 1
+        present = sum(seen.values())
+        types = ", ".join(
+            f"{ctype} ({count})" if len(seen) > 1 else ctype
+            for ctype, count in sorted(seen.items(), key=lambda kv: (-kv[1], kv[0]))
+        )
+        verdict, kind = _drift_verdict(
+            session, column, seen, ref_types, present, len(schemas), reference, budget=budget
+        )
+        {"drop": drops, "fail": failures, "narrow": narrowings}.get(kind, []).append(column)
+        records.append([column, f"{present}/{len(schemas)}", types, verdict])
+
+    header = (
+        f"**{path}** — {len(files):,} {_plural(len(files), 'file')}, "
+        f"{len(signatures)} distinct {_plural(len(signatures), 'schema')} "
+        f"across {len(schemas)} compared"
+    )
+    parts = [header, _compare_scope(files, chosen, schemas, reference, unreadable)]
+
+    table, emitted = to_markdown_table(
+        ["column", "files", "types", "a plain read"], records, max_bytes=settings.max_bytes
+    )
+    parts.append(table)
+    note = truncation_note(emitted, len(records), settings.max_bytes, unit="columns")
+    if note:
+        parts.append(note)
+
+    if len(signatures) == 1:
+        parts.append("Every compared file has the same schema; a plain read is safe.")
+    else:
+        parts.extend(_drift_advice(path, drops, failures, narrowings))
+    return "\n\n".join(part for part in parts if part)
+
+
+def _spread(files: Sequence[str], limit: int) -> list[str]:
+    """Pick ``limit`` files, keeping the first and the last.
+
+    Drift tends to track the order files were written in, so the first N of a
+    large glob would be the oldest files and would miss exactly the recent
+    change worth finding. An even spread keeps the reference file -- the one
+    whose schema a plain read adopts -- and still reaches the newest.
+    """
+    if len(files) <= limit:
+        return list(files)
+    step = (len(files) - 1) / (limit - 1)
+    picked = {0, len(files) - 1}
+    picked.update(round(index * step) for index in range(limit))
+    return [files[index] for index in sorted(picked)[:limit]]
+
+
+def _compare_scope(
+    files: Sequence[str],
+    chosen: Sequence[str],
+    schemas: dict[str, list[tuple[str, str]]],
+    reference: str,
+    unreadable: Sequence[str],
+) -> str:
+    """State what was compared and which file sets the schema."""
+    lines = []
+    if len(chosen) < len(files):
+        lines.append(
+            f"Compared {len(chosen)} of {len(files):,} files, spread across the glob "
+            "(raise max_files to compare more)."
+        )
+    lines.append(
+        f"A plain read takes its schema from the first file, "
+        f"`{os.path.basename(reference)}`: "
+        + ", ".join(f"{name} {ctype}" for name, ctype in schemas[reference])
+    )
+    if unreadable:
+        shown = ", ".join(os.path.basename(name) for name in unreadable[:5])
+        lines.append(
+            f"{len(unreadable)} {_plural(len(unreadable), 'file')} "
+            f"could not be read at all: {shown}"
+        )
+    return "\n\n".join(lines)
+
+
+def _drift_verdict(
+    session: DuckDBSession,
+    column: str,
+    seen: dict[str, int],
+    ref_types: dict[str, str],
+    present: int,
+    total: int,
+    reference: str,
+    *,
+    budget: TimeBudget,
+) -> tuple[str, str]:
+    """What a plain read does to one column, and which warning it belongs to."""
+    if column not in ref_types:
+        return (f"drops it — absent from {os.path.basename(reference)}", "drop")
+    if present < total:
+        absent = total - present
+        return (f"fails — missing from {absent} compared {_plural(absent, 'file')}", "fail")
+
+    ref_type = ref_types[column]
+    others = [ctype for ctype in seen if ctype != ref_type]
+    if not others:
+        return ("ok", "")
+
+    worst, kind = "", ""
+    for other in others:
+        relation = _reconcile(session, ref_type, other, budget=budget)
+        if relation == "incompatible":
+            return (f"fails — cannot read {other} as {ref_type}", "fail")
+        if relation == "narrowing":
+            worst, kind = f"narrows {other} to {ref_type} — values are lost", "narrow"
+        elif not worst:
+            worst, kind = f"casts to {ref_type}", ""
+    return (worst, kind)
+
+
+def _reconcile(
+    session: DuckDBSession, ref_type: str, other: str, *, budget: TimeBudget
+) -> str:
+    """How ``other`` fares when forced into ``ref_type``.
+
+    DuckDB's own rules decide it: the common supertype of the two is the type
+    that loses nothing, so a reference type that is not the supertype must be
+    narrower, and no supertype at all means the read cannot reconcile them.
+    """
+    if not (_PLAIN_TYPE.match(ref_type) and _PLAIN_TYPE.match(other)):
+        return "unknown"
+    try:
+        _, rows = session.execute(
+            f"SELECT typeof(coalesce(NULL::{ref_type}, NULL::{other}))",
+            read_only=False,
+            timeout=budget.remaining(),
+        )
+    except duckdb.Error:
+        return "incompatible"
+    if not rows:
+        return "unknown"
+    return "widening" if str(rows[0][0]) == ref_type else "narrowing"
+
+
+def _drift_advice(
+    path: str, drops: Sequence[str], failures: Sequence[str], narrowings: Sequence[str]
+) -> list[str]:
+    """Spell out the silent losses, then the one option that avoids them."""
+    advice = []
+    if drops:
+        advice.append(
+            f"Silently dropped: {', '.join(drops)}. These are absent from the first file, "
+            "so a plain read returns no such column and reports nothing."
+        )
+    if narrowings:
+        advice.append(
+            f"Silently narrowed: {', '.join(narrowings)}. Values are cast down to the first "
+            "file's type, so they come back altered rather than rejected."
+        )
+    if failures:
+        advice.append(f"Read fails on: {', '.join(failures)}.")
+
+    reader = _multi_file_reader(path)
+    call = (
+        f"{reader}({sql_string(path)}, union_by_name=true)"
+        if reader
+        else f"read_parquet({sql_string(path)}, union_by_name=true)  -- or read_csv "
+        "/ read_json_auto, to match the format"
+    )
+    advice.append(
+        "Reconcile every file's columns by name instead:\n\n"
+        f"```sql\nSELECT * FROM {call}\n```\n"
+        "(`union_by_name` widens each column to a type that fits every file, and fills "
+        "absent ones with NULL.)"
+    )
+    return advice
+
+
+def _multi_file_reader(path: str) -> str | None:
+    """The reader that accepts ``union_by_name`` for this path's format."""
+    ext = extension_of(path)
+    for candidate, reader in MULTI_FILE_READERS:
+        if ext == candidate:
+            return reader
+    return None
 
 
 def _top_values(

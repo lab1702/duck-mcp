@@ -76,6 +76,7 @@ No clone, no virtualenv, no `pip install`. To pick up a new release, run
 | `list_files(path, pattern="*", recursive=False)` | List readable data files in a directory or `s3://` prefix. |
 | `profile_columns(path, columns=None, top_k=5)` | Null counts, approximate distinct counts, min/max and most-frequent values. |
 | `parquet_metadata(path, row_groups=False)` | Parquet layout from the footer: sizes, compression, row-group pruning — no scan. |
+| `compare_schemas(path, max_files=100)` | Compare schemas across a glob and say what a plain read does about the differences. |
 
 Files are referenced by path directly in SQL — there is no import or
 registration step:
@@ -199,6 +200,53 @@ which dominates on object storage.
 `row_groups=True` adds a per-row-group table of row counts and sizes, for
 finding uneven splits. Actual value ranges are not reported here — footer
 statistics are approximate by design; use `profile_columns` for real min/max.
+
+### Schema drift across a glob
+
+Reading `data/*.parquet` when the files disagree is not reliably an error.
+DuckDB takes its schema from the first file and reconciles the rest against
+it, so two of the four possible outcomes are silent and wrong:
+
+| difference | what a plain read does |
+| --- | --- |
+| a later file adds a column | **drops it** — no error, the column simply is not there |
+| a later file widens a type | **narrows the values** — `10.5` comes back as `10` |
+| a later file drops a column | read fails |
+| the types cannot reconcile | read fails |
+
+`compare_schemas` reports which of those you are in:
+
+```
+**data/*.parquet** — 3 files, 2 distinct schemas across 3 compared
+
+A plain read takes its schema from the first file, `a.parquet`: id INTEGER, amount INTEGER
+
+| column | files | types                   | a plain read                              |
+| ------ | ----- | ----------------------- | ----------------------------------------- |
+| id     | 3/3   | INTEGER                 | ok                                        |
+| amount | 3/3   | INTEGER (2), DOUBLE (1) | narrows DOUBLE to INTEGER — values are lost |
+| extra  | 1/3   | VARCHAR                 | drops it — absent from a.parquet          |
+```
+
+Whether a difference is harmful depends on direction, so the tool asks DuckDB
+rather than guessing: the common supertype of the two types is the one that
+loses nothing, so a first file whose type is *not* that supertype must be
+narrowing. `DOUBLE` first and `INTEGER` later is fine and reported as such;
+`INTEGER` first and `DOUBLE` later loses your decimals.
+
+The fix in every case is to reconcile by name, which the tool prints with the
+reader matching your format:
+
+```sql
+SELECT * FROM read_parquet('data/*.parquet', union_by_name=true)
+```
+
+Schemas are read one file at a time, so cost is linear in the file count.
+Above `max_files` (default 100) it compares a spread across the glob rather
+than the first N — drift tends to track write order, so the first N files
+would be the oldest and would miss exactly the recent change worth finding.
+The first and last file are always included. Files that cannot be read at all
+are reported rather than skipped silently.
 
 ## Remote files
 

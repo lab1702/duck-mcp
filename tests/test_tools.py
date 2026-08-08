@@ -11,6 +11,7 @@ from duckdb_mcp.config import HARD_MAX_ROWS
 from duckdb_mcp.db import ReadOnlyViolation
 from duckdb_mcp.tools import (
     ToolError,
+    compare_schemas,
     describe_file,
     inspect_raw,
     list_files,
@@ -608,6 +609,174 @@ def test_parquet_metadata_truncates_a_wide_schema(session, settings, tmp_path):
     settings.max_bytes = 700
     out = parquet_metadata(session, settings, wide.as_posix())
     assert "of 120 columns" in out
+
+
+def write_parquet(directory, selects):
+    """Write one parquet file per SELECT, named a.parquet, b.parquet, ..."""
+    import duckdb
+
+    con = duckdb.connect(":memory:")
+    for index, select in enumerate(selects):
+        target = (directory / f"{chr(97 + index)}.parquet").as_posix()
+        con.execute(f"COPY ({select}) TO '{target}'")
+    con.close()
+    return (directory / "*.parquet").as_posix()
+
+
+# Each scenario pairs files whose schemas disagree with what a plain read does
+# about it. "drop" and "narrow" are the silent ones -- no error, wrong answer.
+DRIFT_SCENARIOS = {
+    "clean": (["SELECT 1 AS id", "SELECT 2 AS id"], "clean"),
+    "widening": (["SELECT 1 AS id, 1.5::DOUBLE AS v", "SELECT 2 AS id, 2 AS v"], "clean"),
+    "narrowing": (["SELECT 1 AS id, 10 AS v", "SELECT 2 AS id, 10.5::DOUBLE AS v"], "narrow"),
+    "extra_column": (["SELECT 1 AS id", "SELECT 2 AS id, 'gone' AS extra"], "drop"),
+    "missing_column": (["SELECT 1 AS id, 'keep' AS only_a", "SELECT 2 AS id"], "fail"),
+    "incompatible": (["SELECT 1 AS id, 10 AS v", "SELECT 2 AS id, 'ten' AS v"], "fail"),
+}
+
+
+def drift_prediction(report: str) -> str:
+    if "Read fails on:" in report:
+        return "fail"
+    if "Silently dropped" in report:
+        return "drop"
+    if "Silently narrowed" in report:
+        return "narrow"
+    return "clean"
+
+
+@pytest.mark.parametrize("scenario", list(DRIFT_SCENARIOS))
+def test_compare_schemas_predicts_what_a_plain_read_really_does(
+    session, settings, tmp_path, scenario
+):
+    """The tool's claims must match DuckDB, or they are worse than no tool."""
+    import duckdb
+
+    selects, expected = DRIFT_SCENARIOS[scenario]
+    glob = write_parquet(tmp_path, selects)
+    assert drift_prediction(compare_schemas(session, settings, glob)) == expected
+
+    # Now establish what actually happens, independently of the tool.
+    con = duckdb.connect(":memory:")
+    try:
+        union = con.sql(f"SELECT * FROM read_parquet('{glob}', union_by_name=true) ORDER BY id")
+        union_columns, union_rows = list(union.columns), union.fetchall()
+        try:
+            plain = con.sql(f"SELECT * FROM '{glob}' ORDER BY id")
+            plain_columns, plain_rows = list(plain.columns), plain.fetchall()
+        except duckdb.Error:
+            actual = "fail"
+        else:
+            if set(union_columns) - set(plain_columns):
+                actual = "drop"
+            elif plain_rows != [
+                tuple(row[union_columns.index(col)] for col in plain_columns)
+                for row in union_rows
+            ]:
+                actual = "narrow"
+            else:
+                actual = "clean"
+    finally:
+        con.close()
+    assert actual == expected
+
+
+def test_compare_schemas_names_the_dropped_column(session, settings, tmp_path):
+    glob = write_parquet(tmp_path, ["SELECT 1 AS id", "SELECT 2 AS id, 'gone' AS extra"])
+    out = compare_schemas(session, settings, glob)
+    assert "2 distinct schemas" in out
+    assert "drops it — absent from a.parquet" in row_for(out, "extra")
+    assert "| extra | 1/2 |" in out
+    assert "Silently dropped: extra" in out
+
+
+def test_compare_schemas_names_the_narrowed_column(session, settings, tmp_path):
+    glob = write_parquet(
+        tmp_path, ["SELECT 1 AS id, 10 AS v", "SELECT 2 AS id, 10.5::DOUBLE AS v"]
+    )
+    out = compare_schemas(session, settings, glob)
+    assert "narrows DOUBLE to INTEGER" in row_for(out, "v")
+    assert "Silently narrowed: v" in out
+
+
+def test_compare_schemas_accepts_a_widening_difference(session, settings, tmp_path):
+    """DOUBLE first, INTEGER later loses nothing, so it must not be alarming."""
+    glob = write_parquet(
+        tmp_path, ["SELECT 1 AS id, 1.5::DOUBLE AS v", "SELECT 2 AS id, 2 AS v"]
+    )
+    out = compare_schemas(session, settings, glob)
+    assert "Silently narrowed" not in out
+    assert "Read fails" not in out
+    assert "casts to DOUBLE" in row_for(out, "v")
+
+
+def test_compare_schemas_is_quiet_when_files_agree(session, settings, tmp_path):
+    glob = write_parquet(tmp_path, ["SELECT 1 AS id, 'x' AS name", "SELECT 2 AS id, 'y' AS name"])
+    out = compare_schemas(session, settings, glob)
+    assert "1 distinct schema " in out
+    assert "a plain read is safe" in out
+    assert "union_by_name" not in out
+
+
+def test_compare_schemas_handles_nested_types(session, settings, tmp_path):
+    glob = write_parquet(
+        tmp_path,
+        ["SELECT 1 AS id, [1,2] AS tags, {'k': 1} AS meta",
+         "SELECT 2 AS id, ['a'] AS tags, {'k': 1} AS meta"],
+    )
+    out = compare_schemas(session, settings, glob)
+    # Nested columns must keep their own names, not their inner field names.
+    assert "| tags |" in out and "| meta |" in out
+    assert "element" not in out
+    assert "INTEGER[]" in row_for(out, "tags")
+    assert "ok" in row_for(out, "meta")
+
+
+def test_compare_schemas_suggests_the_reader_matching_the_format(session, settings, tmp_path):
+    csvs = tmp_path / "csvs"
+    csvs.mkdir()
+    (csvs / "jan.csv").write_text("id,name\n1,x\n", encoding="utf-8")
+    (csvs / "feb.csv").write_text("id,name,region\n2,y,west\n", encoding="utf-8")
+    out = compare_schemas(session, settings, (csvs / "*.csv").as_posix())
+    assert "read_csv(" in out
+    assert "read_parquet(" not in out
+
+
+def test_compare_schemas_spreads_across_a_large_glob(session, settings, tmp_path):
+    """Drift tracks write order, so sampling the front would miss a late change."""
+    import duckdb
+
+    con = duckdb.connect(":memory:")
+    for index in range(40):
+        extra = ", 'late' AS added" if index >= 38 else ""
+        con.execute(
+            f"COPY (SELECT {index} AS id{extra}) TO "
+            f"'{(tmp_path / f'p{index:03d}.parquet').as_posix()}'"
+        )
+    con.close()
+
+    out = compare_schemas(session, settings, (tmp_path / "*.parquet").as_posix(), max_files=6)
+    assert "Compared 6 of 40 files" in out
+    assert "added" in out  # the last file is always included, so the drift is seen
+
+
+def test_compare_schemas_reports_a_single_file_plainly(session, settings, data_dir):
+    out = compare_schemas(session, settings, (data_dir / "sales.parquet").as_posix())
+    assert "nothing to compare" in out
+    assert "region" in out  # still shows the schema
+
+
+def test_compare_schemas_survives_an_unreadable_file(session, settings, tmp_path):
+    write_parquet(tmp_path, ["SELECT 1 AS id", "SELECT 2 AS id"])
+    (tmp_path / "c.parquet").write_bytes(b"not parquet at all")
+    out = compare_schemas(session, settings, (tmp_path / "*.parquet").as_posix())
+    assert "could not be read at all: c.parquet" in out
+    assert "| id | 2/2 |" in out  # the readable files are still compared
+
+
+def test_compare_schemas_reports_no_match(session, settings, tmp_path):
+    with pytest.raises(ToolError, match="No files matched"):
+        compare_schemas(session, settings, (tmp_path / "*.parquet").as_posix())
 
 
 def test_join_across_formats(session, settings, data_dir):
