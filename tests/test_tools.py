@@ -403,6 +403,54 @@ def test_list_files_reports_empty(session, settings, tmp_path):
     assert "No matching files" in list_files(session, settings, tmp_path.as_posix())
 
 
+def test_list_files_resolves_a_relative_path(session, settings, tmp_path, monkeypatch):
+    """A relative listing is useless without knowing what it was relative to."""
+    (tmp_path / "sales.csv").write_text("a\n1\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    out = list_files(session, settings, ".")
+    assert "sales.csv" in out
+    assert "the server's working directory" in out
+    assert tmp_path.as_posix() in out
+
+
+def test_list_files_says_where_it_looked_when_empty(session, settings, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    out = list_files(session, settings, "nowhere")
+    assert "No matching files" in out
+    assert (tmp_path / "nowhere").as_posix() in out
+
+
+def test_list_files_omits_the_note_for_an_absolute_path(session, settings, tmp_path):
+    """Nothing was resolved, so there is nothing to explain."""
+    (tmp_path / "sales.csv").write_text("a\n1\n", encoding="utf-8")
+    out = list_files(session, settings, tmp_path.as_posix())
+    assert "sales.csv" in out
+    assert "working directory" not in out
+
+
+@pytest.mark.parametrize(
+    "pattern", ["s3://bucket/prefix/*.parquet", "https://host/data/*.csv", "/data/*.csv"]
+)
+def test_list_files_does_not_claim_to_resolve_these(pattern):
+    """A URL has no working directory, and a leading slash is not relative to
+    one -- '/data' resolves to the drive root on Windows, not the cwd."""
+    from duckdb_mcp.tools import _resolved_pattern
+
+    assert _resolved_pattern(pattern) is None
+
+
+def test_list_files_blames_the_filter_not_the_location(session, settings, tmp_path, monkeypatch):
+    """Files were found and then filtered; pointing at the directory would mislead."""
+    (tmp_path / "notes.md").write_text("x\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    out = list_files(session, settings, ".", pattern="*.md")
+    assert "1 other file matched" in out
+    assert "data_files_only=false" in out
+    assert "working directory" not in out
+
+
 def test_list_files_stats_only_the_rows_it_renders(session, settings, tmp_path, monkeypatch):
     """Listing a huge directory must not cost one syscall per file."""
     for i in range(40):
@@ -415,7 +463,7 @@ def test_list_files_stats_only_the_rows_it_renders(session, settings, tmp_path, 
     settings.max_rows = 5
     out = list_files(session, settings, tmp_path.as_posix())
     assert len(stats) == 5
-    assert "40 file(s)" in out
+    assert "40 files" in out
     assert "showing 5 of 40 rows" in out
 
 
@@ -533,7 +581,7 @@ def test_parquet_metadata_reads_the_footer_without_scanning(
     out = parquet_metadata(session, settings, (layout_dir / "sorted.parquet").as_posix())
     assert scanned == []
     assert "60,000 rows" in out
-    assert "6 row group(s)" in out
+    assert "6 row groups" in out
 
 
 def test_parquet_metadata_marks_a_sorted_column_ascending(session, settings, layout_dir):
@@ -568,7 +616,7 @@ def test_parquet_metadata_shows_per_column_size(session, settings, layout_dir):
 
 def test_parquet_metadata_warns_about_small_files_and_row_groups(session, settings, layout_dir):
     out = parquet_metadata(session, settings, (layout_dir / "many" / "*.parquet").as_posix())
-    assert "4 parquet file(s), 2,000 rows" in out
+    assert "4 parquet files, 2,000 rows" in out
     assert "row groups average only" in out
     assert "4 files averaging" in out
 

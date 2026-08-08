@@ -401,6 +401,21 @@ def _sniff_csv(
 # --------------------------------------------------------------------------
 
 
+def _resolved_pattern(glob_pattern: str) -> str | None:
+    """Absolute form of a pattern the working directory decides, else ``None``.
+
+    Only a genuinely working-directory-relative path gets one. A URL has no
+    working directory, and a leading slash is root-relative on POSIX and
+    drive-relative on Windows -- ``/data`` resolves to ``C:/data``, not to
+    anything under the current directory -- so neither is worth annotating.
+    """
+    if "://" in glob_pattern or os.path.isabs(glob_pattern):
+        return None
+    if glob_pattern.startswith(("/", "\\")):
+        return None
+    return os.path.abspath(glob_pattern).replace("\\", "/")
+
+
 def list_files(
     session: DuckDBSession,
     settings: Settings,
@@ -418,12 +433,31 @@ def list_files(
     # caller will paste back into a query.
     files = [row[0].replace("\\", "/") for row in rows]
 
+    found = len(files)
     if data_files_only:
         files = [f for f in files if _is_data_file(f)]
 
+    resolved = _resolved_pattern(glob_pattern)
     total = len(files)
     if not total:
-        return f"No matching files under {glob_pattern}"
+        if found:
+            # The path was right and the files are there; only the extension
+            # filter rejected them. Saying "no matching files" and pointing at
+            # the directory would send the caller looking in the wrong place.
+            return (
+                f"No readable data files under {glob_pattern}, though {found} other "
+                f"{_plural(found, 'file')} matched. Pass data_files_only=false to see them."
+            )
+        message = f"No matching files under {glob_pattern}"
+        if resolved:
+            # Looking in the wrong place is the likeliest cause, and the caller
+            # cannot otherwise tell where that was.
+            message += (
+                f".\n\nLooked in `{os.path.dirname(resolved)}` — the server's working "
+                "directory, which is not necessarily yours. Pass an absolute path to "
+                "list somewhere else."
+            )
+        return message
 
     # Stat only the rows that will be rendered. A directory holding a hundred
     # thousand files should not cost a hundred thousand syscalls to show the
@@ -442,13 +476,17 @@ def list_files(
                 pass
         table_rows.append((name, size, modified))
 
+    header = f"**{glob_pattern}** — {total} {_plural(total, 'file')}"
+    if resolved:
+        header += f"\n\nRelative to the server's working directory, so this is `{resolved}`."
+
     return render_result(
         ["file", "size_bytes", "modified"],
         table_rows,
         max_rows=shown,
         max_bytes=settings.max_bytes,
         total_rows=total,
-        header=f"**{glob_pattern}** — {total} file(s)",
+        header=header,
     )
 
 
@@ -655,8 +693,8 @@ def parquet_metadata(
         ])
 
     header = (
-        f"**{path}** — {files:,} parquet file(s), {rows:,} rows, "
-        f"{groups:,} row group(s), {format_size(int(size or 0))} on disk"
+        f"**{path}** — {files:,} parquet {_plural(files, 'file')}, {rows:,} rows, "
+        f"{groups:,} row {_plural(groups, 'group')}, {format_size(int(size or 0))} on disk"
     )
     detail = f"Written by {created_by or 'unknown'}"
     if version is not None:
