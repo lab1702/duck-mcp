@@ -65,6 +65,14 @@ No clone, no virtualenv, no `pip install`. `uvx` re-resolves the repository each
 time it starts the server, so a new session already runs the current `main` —
 there is no separate update step.
 
+The same re-resolution means the server will not start without a network. A
+warm cache does not save you, and neither does pinning the URL to a commit:
+`uvx` contacts GitHub before it runs anything, and exits with a git error
+instead of starting the server. If you need it to work offline, do a
+[development](#development) checkout — that runs from a local environment with
+nothing to fetch — and point your MCP config at `.venv/Scripts/duckdb-mcp`
+(`.venv/bin/duckdb-mcp` on macOS/Linux) instead of `uvx`.
+
 ## Tools
 
 Finding and reading data:
