@@ -26,8 +26,13 @@ curl -LsSf https://astral.sh/uv/install.sh | sh   # macOS / Linux
 ### Claude Code
 
 ```bash
-claude mcp add duckdb -- uvx --from git+https://github.com/lab1702/duck-mcp duckdb-mcp
+claude mcp add -s user duckdb -- uvx --from git+https://github.com/lab1702/duck-mcp duckdb-mcp
 ```
+
+`-s user` registers the server for every project. Without it, `claude mcp add`
+defaults to `local` scope and the server is only available in the directory you
+ran the command in — it will not appear under `/mcp` anywhere else. Restart
+Claude Code afterwards; `/mcp` reads the config at startup.
 
 ### Claude Desktop / other MCP clients
 
