@@ -66,19 +66,28 @@ No clone, no virtualenv, no `pip install`. To pick up a new release, run
 
 ## Tools
 
+Finding and reading data:
+
 | Tool | What it does |
 | --- | --- |
-| `query(sql, max_rows=500)` | Run a read-only SQL statement, returns a markdown table. |
+| `query(sql, max_rows=None)` | Run a read-only SQL statement, returns a markdown table. Defaults to the server's row cap (500). |
+| `list_files(path=".", pattern="*", recursive=False, data_files_only=True)` | List files in a directory or `s3://` prefix. Only readable data formats unless `data_files_only=False`. |
 | `describe_file(path, include_row_count=True)` | Column names, types and row count for a file or glob. |
 | `preview_file(path, rows=20)` | First N rows, so the model sees real values. |
 | `sample_rows(path, rows=20, seed=None)` | A *random* sample of rows, for files whose head is not representative. |
-| `inspect_raw(path, lines=20)` | Raw lines of a text file, before parsing, plus what the CSV sniffer detected. |
-| `list_files(path, pattern="*", recursive=False)` | List readable data files in a directory or `s3://` prefix. |
 | `profile_columns(path, columns=None, top_k=5)` | Null counts, approximate distinct counts, min/max and most-frequent values. |
-| `parquet_metadata(path, row_groups=False)` | Parquet layout from the footer: sizes, compression, row-group pruning — no scan. |
-| `compare_schemas(path, max_files=100)` | Compare schemas across a glob and say what a plain read does about the differences. |
-| `check_join(left, right, left_on, right_on=None)` | What a join will do before you run it: fan-out, match rates, orphans. |
 | `find_value(path, value, columns=None, exact=False)` | Which columns — and which files — contain a value. |
+
+Checking that an answer is the right one. Most of what goes wrong with a data
+file is not an error — it is a plausible number that happens to be wrong. These
+four look for that:
+
+| Tool | What it does |
+| --- | --- |
+| `inspect_raw(path, lines=20)` | Raw lines of a text file, before parsing, plus what the CSV sniffer detected. |
+| `compare_schemas(path, max_files=None)` | Compare schemas across a glob and say what a plain read does about the differences. Reads up to 100 files. |
+| `check_join(left, right, left_on, right_on=None)` | What a join will do before you run it: fan-out, match rates, orphans. |
+| `parquet_metadata(path, row_groups=False)` | Parquet layout from the footer: sizes, compression, row-group pruning — no scan. |
 
 Files are referenced by path directly in SQL — there is no import or
 registration step:
