@@ -155,9 +155,15 @@ a bad environment variable is ignored with a line on stderr.
 ```bash
 git clone https://github.com/lab1702/duck-mcp
 cd duck-mcp
-uv sync --extra dev
+uv sync --extra dev --upgrade
 uv run pytest
 ```
+
+There is no committed `uv.lock`. Dependencies are declared with lower bounds
+only, so a fresh install — and `uvx` — resolves to the current `duckdb` and
+`mcp` releases. `--upgrade` re-resolves an existing checkout to the latest
+versions; run the tests after, since tracking upstream means meeting its
+breaking changes early rather than at a pinned upgrade later.
 
 Or without uv:
 
