@@ -270,6 +270,28 @@ async def find_value(
     )
 
 
+@mcp.tool()
+async def check_coverage(path: str, column: str, granularity: str | None = None) -> str:
+    """Find missing and repeated values in a column that should run in regular steps.
+
+    Use this on a date, timestamp or sequence column before totalling or
+    averaging over it. A table missing three days still sums perfectly happily,
+    just short, and one where a day was loaded twice sums too high; neither
+    shows up as an error or in a row count. Reports where the holes are, how
+    much each hides, and which values repeat.
+
+    Args:
+        path: File path, glob or URL.
+        column: The date, timestamp or numeric column expected to be regular.
+        granularity: Bucket a timestamp first -- year, quarter, month, week,
+            day, hour, minute or second. Needed when timestamps carry a time
+            of day but the data is really per-day.
+    """
+    return await _call(
+        tools.check_coverage, get_session(), settings, path, column, granularity
+    )
+
+
 def _positive_int(text: str) -> int:
     """An argparse type that rejects what would otherwise break every query."""
     try:

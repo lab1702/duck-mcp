@@ -87,6 +87,7 @@ four look for that:
 | `inspect_raw(path, lines=20)` | Raw lines of a text file, before parsing, plus what the CSV sniffer detected. |
 | `compare_schemas(path, max_files=None)` | Compare schemas across a glob and say what a plain read does about the differences. Reads up to 100 files. |
 | `check_join(left, right, left_on, right_on=None)` | What a join will do before you run it: fan-out, match rates, orphans. |
+| `check_coverage(path, column, granularity=None)` | Missing and repeated values in a column that should run in regular steps. |
 | `parquet_metadata(path, row_groups=False)` | Parquet layout from the footer: sizes, compression, row-group pruning — no scan. |
 
 Files are referenced by path directly in SQL — there is no import or
@@ -293,6 +294,46 @@ asserts it against the join it declined to run.
 It also reports rows that match nothing, so you can see an inner join dropping
 half your data, and diagnoses a join returning nothing at all: keys that are
 entirely NULL, or key columns whose types cannot be compared.
+
+### Gaps in a series
+
+A daily table missing three days still sums and averages perfectly happily —
+the total is just quietly short. One where a day was loaded twice sums too
+high. Neither shows up as an error, and neither changes anything a row count
+would reveal:
+
+```
+count(*) = 29, sum = 290       <- looks entirely fine
+```
+
+`check_coverage` infers the step from the data and reports what is absent:
+
+```
+29 rows, 28 distinct values from 2026-01-01 to 2026-01-31.
+Step looks like 1 day (25 of 27 intervals), so 31 values were expected.
+
+3 missing (9.7% of the expected range) across 2 gaps.
+
+| after      | before     | missing |
+| ---------- | ---------- | ------- |
+| 2026-01-08 | 2026-01-11 | 2       |
+| 2026-01-24 | 2026-01-26 | 1       |
+
+1 repeated value. A sum over this column double-counts them.
+
+| value      | rows |
+| ---------- | ---- |
+| 2026-01-05 | 2    |
+```
+
+The step is inferred rather than assumed, so the same tool covers dates,
+timestamps and plain integer sequences. Calendar steps are not constant — a
+month is 28 to 31 days — so an interval counts as a gap only once it is half
+again the usual step, which finds a missing month without reporting February
+as a hole every year.
+
+For timestamps carrying a time of day that really describe a daily series,
+pass `granularity='day'` (or `hour`, `month`, …) to bucket them first.
 
 ### Finding where a value lives
 

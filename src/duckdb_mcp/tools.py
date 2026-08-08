@@ -59,6 +59,24 @@ COMPARE_MAX_FILES = 100
 # find_value adds one conditional aggregate per column to a single query.
 SEARCH_MAX_COLUMNS = 60
 
+# check_coverage calls an interval a gap once it is half again the usual step.
+# Calendar steps are not constant -- a month is 28 to 31 days -- so comparing
+# against the step exactly would report every short month as a hole, and
+# requiring a full doubled step would miss a genuine one-month hole (61 days
+# against a 31-day step). Halfway between separates the two cleanly.
+GAP_TOLERANCE = 1.5
+
+COVERAGE_MAX_ROWS = 50
+
+# Only these may be interpolated into date_trunc.
+GRANULARITIES = ("year", "quarter", "month", "week", "day", "hour", "minute", "second")
+
+_TEMPORAL_PREFIXES = ("DATE", "TIMESTAMP", "TIME")
+_NUMERIC_PREFIXES = (
+    "TINYINT", "SMALLINT", "INTEGER", "BIGINT", "HUGEINT", "UTINYINT", "USMALLINT",
+    "UINTEGER", "UBIGINT", "UHUGEINT", "FLOAT", "DOUBLE", "REAL", "DECIMAL",
+)
+
 _GLOB_CHARS = ("*", "?", "[")
 
 # Type names are interpolated into a cast to ask DuckDB how two of them
@@ -1402,6 +1420,186 @@ def _filename_reader(path: str) -> str | None:
     """A reader call that adds a ``filename`` column, so matches can be located."""
     reader = _multi_file_reader(path)
     return None if reader is None else f"{reader}({sql_string(path)}, filename=true)"
+
+
+# --------------------------------------------------------------------------
+# check_coverage
+# --------------------------------------------------------------------------
+
+
+def check_coverage(
+    session: DuckDBSession,
+    settings: Settings,
+    path: str,
+    column: str,
+    granularity: str | None = None,
+) -> str:
+    """Find holes and repeats in a column that should run in regular steps.
+
+    A daily table missing three days still sums and averages perfectly happily;
+    the total is just quietly short. So is one where a day was loaded twice.
+    Neither shows up as an error, and neither shows up in a row count.
+    """
+    budget = session.budget()
+    source = source_expr(path)
+    described = {name: ctype for name, ctype, _ in _describe(session, source, budget=budget)}
+    if column not in described:
+        raise ToolError(
+            f"{path} has no column named {column}. Available: {', '.join(described)}"
+        )
+
+    ctype = described[column].upper()
+    temporal = ctype.startswith(_TEMPORAL_PREFIXES)
+    if not temporal and not ctype.startswith(_NUMERIC_PREFIXES):
+        raise ToolError(
+            f"{column} is {described[column]}, which has no regular step to check. "
+            "Coverage applies to dates, timestamps and numbers; for anything else "
+            "profile_columns reports the repeated values."
+        )
+
+    key = quote_ident(column)
+    if granularity:
+        if not temporal:
+            raise ToolError(f"granularity only applies to dates and timestamps, not {ctype}.")
+        if granularity not in GRANULARITIES:
+            raise ToolError(
+                f"Unknown granularity {granularity!r}. Use one of: {', '.join(GRANULARITIES)}."
+            )
+        key = f"date_trunc('{granularity}', {key})"
+    # Arithmetic happens on a numeric ordinal because subtracting two
+    # timestamps yields an INTERVAL, which will not divide; the original value
+    # is carried alongside so the report can still name real dates.
+    ordinal = f"epoch({key})" if temporal else f"({key})::DOUBLE"
+
+    _, rows = _run(
+        session,
+        f"""WITH v AS (
+                SELECT {key} AS k, {ordinal} AS o, count(*) AS n
+                FROM {source} WHERE {key} IS NOT NULL GROUP BY 1, 2
+            ),
+            s AS (
+                SELECT k, o, n,
+                       lag(k) OVER (ORDER BY o) AS prev_k,
+                       lag(o) OVER (ORDER BY o) AS prev_o
+                FROM v
+            ),
+            step AS (
+                SELECT o - prev_o AS d, any_value(k - prev_k) AS shown, count(*) AS freq
+                FROM s WHERE prev_o IS NOT NULL GROUP BY 1 ORDER BY freq DESC, d LIMIT 1
+            )
+            SELECT (SELECT coalesce(sum(n), 0) FROM v),
+                   (SELECT count(*) FROM v),
+                   (SELECT count(*) FROM {source} WHERE {key} IS NULL),
+                   (SELECT min(k) FROM v), (SELECT max(k) FROM v),
+                   (SELECT shown FROM step), (SELECT freq FROM step),
+                   (SELECT list({{'after': prev_k, 'before': k,
+                                  'missing': (round((o - prev_o) / step.d) - 1)::BIGINT}}
+                                ORDER BY o)
+                      FROM s, step
+                     WHERE prev_o IS NOT NULL
+                       AND (o - prev_o) > step.d * {GAP_TOLERANCE}
+                       AND round((o - prev_o) / step.d) - 1 >= 1),
+                   (SELECT list({{'value': k, 'rows': n}} ORDER BY n DESC, k) FROM v WHERE n > 1)
+        """,
+        budget=budget,
+    )
+    total, distinct, nulls, low, high, step_shown, step_freq, gaps, dupes = rows[0]
+    total, distinct, nulls = int(total or 0), int(distinct or 0), int(nulls or 0)
+
+    header = f"**{path}** — coverage of `{column}`"
+    if granularity:
+        header += f" by {granularity}"
+    if distinct == 0:
+        return f"{header}\n\nEvery row is NULL here, so there is no sequence to check."
+    if distinct == 1:
+        return (
+            f"{header}\n\nOnly one distinct value ({format_cell(low)}), so there is no step "
+            "to infer and nothing to be missing."
+        )
+
+    gaps = gaps or []
+    dupes = dupes or []
+    missing = sum(int(gap["missing"]) for gap in gaps)
+    expected = distinct + missing
+
+    parts = [
+        header,
+        f"{total:,} rows, {distinct:,} distinct values from {format_cell(low)} to "
+        f"{format_cell(high)}"
+        + (f", plus {nulls:,} NULL {_plural(nulls, 'row')}" if nulls else "")
+        + f". Step looks like {_format_step(step_shown, ctype)} "
+        f"({step_freq:,} of {distinct - 1:,} intervals), so {expected:,} values were expected.",
+    ]
+    parts.extend(_coverage_findings(settings, gaps, dupes, missing, expected))
+    return "\n\n".join(part for part in parts if part)
+
+
+def _format_step(value: Any, ctype: str) -> str:
+    """Name the inferred step in its own units.
+
+    Subtracting two timestamps gives a ``timedelta``, whose repr is
+    ``1 day, 0:00:00``, and subtracting two dates gives a bare number of days.
+    Neither says "one day" on its own.
+    """
+    if isinstance(value, dt.timedelta):
+        seconds = value.total_seconds()
+        for size, unit in ((86400, "day"), (3600, "hour"), (60, "minute")):
+            if seconds >= size and seconds % size == 0:
+                count = int(seconds // size)
+                return f"{count} {_plural(count, unit)}"
+        if seconds == int(seconds):
+            return f"{int(seconds)} {_plural(int(seconds), 'second')}"
+    elif ctype.startswith("DATE") and isinstance(value, (int, float)) and value == int(value):
+        return f"{int(value)} {_plural(int(value), 'day')}"
+    return format_cell(value)
+
+
+def _coverage_findings(
+    settings: Settings,
+    gaps: Sequence[dict[str, Any]],
+    dupes: Sequence[dict[str, Any]],
+    missing: int,
+    expected: int,
+) -> list[str]:
+    """Tables for the holes and the repeats, or a clean bill of health."""
+    if not gaps and not dupes:
+        return ["No gaps and no repeats: every step is present exactly once."]
+
+    parts = []
+    if gaps:
+        shown = list(gaps)[:COVERAGE_MAX_ROWS]
+        table, _ = to_markdown_table(
+            ["after", "before", "missing"],
+            [[format_cell(g["after"]), format_cell(g["before"]), f"{int(g['missing']):,}"]
+             for g in shown],
+            max_bytes=settings.max_bytes,
+        )
+        share = missing / expected * 100 if expected else 0
+        note = (
+            f"**{missing:,} missing** ({share:.1f}% of the expected range) across "
+            f"{len(gaps):,} {_plural(len(gaps), 'gap')}. A total over this range is "
+            "short by whatever those held."
+        )
+        parts.append(note)
+        parts.append(table)
+        if len(gaps) > len(shown):
+            parts.append(f"({len(shown):,} of {len(gaps):,} gaps shown)")
+
+    if dupes:
+        shown = list(dupes)[:COVERAGE_MAX_ROWS]
+        table, _ = to_markdown_table(
+            ["value", "rows"],
+            [[format_cell(d["value"]), f"{int(d['rows']):,}"] for d in shown],
+            max_bytes=settings.max_bytes,
+        )
+        parts.append(
+            f"**{len(dupes):,} repeated {_plural(len(dupes), 'value')}.** A sum over this "
+            "column double-counts them — often a period loaded twice."
+        )
+        parts.append(table)
+        if len(dupes) > len(shown):
+            parts.append(f"({len(shown):,} of {len(dupes):,} repeats shown)")
+    return parts
 
 
 def _top_values(

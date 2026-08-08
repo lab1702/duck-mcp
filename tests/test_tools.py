@@ -11,6 +11,7 @@ from duckdb_mcp.config import HARD_MAX_ROWS
 from duckdb_mcp.db import ReadOnlyViolation
 from duckdb_mcp.tools import (
     ToolError,
+    check_coverage,
     check_join,
     compare_schemas,
     describe_file,
@@ -1107,6 +1108,140 @@ def test_find_value_restricts_to_named_columns(session, settings, search_dir):
 def test_find_value_rejects_an_empty_value(session, settings, search_dir):
     with pytest.raises(ToolError, match="must not be empty"):
         find_value(session, settings, (search_dir / "customers.parquet").as_posix(), "")
+
+
+@pytest.fixture(scope="session")
+def coverage_dir(tmp_path_factory):
+    """January 2026 daily, with 9th/10th/25th missing and the 5th loaded twice."""
+    import duckdb
+
+    directory = tmp_path_factory.mktemp("coverage")
+    con = duckdb.connect(":memory:")
+
+    def write(name, select):
+        con.execute(f"COPY ({select}) TO '{(directory / name).as_posix()}'")
+
+    write("daily.parquet", """
+        SELECT day::DATE AS day, day::TIMESTAMP + INTERVAL 3 HOUR AS ts, 10 AS amount
+        FROM generate_series(DATE '2026-01-01', DATE '2026-01-31', INTERVAL 1 DAY) t(day)
+        WHERE day NOT IN (DATE '2026-01-09', DATE '2026-01-10', DATE '2026-01-25')
+        UNION ALL
+        SELECT DATE '2026-01-05', DATE '2026-01-05'::TIMESTAMP + INTERVAL 3 HOUR, 10
+    """)
+    write("clean.parquet", """
+        SELECT day::DATE AS day
+        FROM generate_series(DATE '2026-01-01', DATE '2026-01-31', INTERVAL 1 DAY) t(day)
+    """)
+    write("monthly.parquet", """
+        SELECT m::DATE AS month
+        FROM generate_series(DATE '2026-01-01', DATE '2026-12-01', INTERVAL 1 MONTH) t(m)
+        WHERE m <> DATE '2026-07-01'
+    """)
+    write("seq.parquet", "SELECT i AS seq FROM range(100) t(i) WHERE i NOT IN (42, 43)")
+    write("text.parquet", "SELECT 'x' AS label FROM range(3)")
+    write("nulls.parquet", "SELECT NULL::DATE AS day FROM range(3)")
+    write("one.parquet", "SELECT DATE '2026-01-01' AS day FROM range(3)")
+    con.close()
+    return directory
+
+
+def test_check_coverage_finds_holes_and_repeats(session, settings, coverage_dir):
+    """A sum over this file is short three days and double-counts a fourth."""
+    out = check_coverage(session, settings, (coverage_dir / "daily.parquet").as_posix(), "day")
+    assert "Step looks like 1 day" in out
+    assert "31 values were expected" in out
+    assert "**3 missing**" in out
+    assert "| 2026-01-08 | 2026-01-11 | 2 |" in out
+    assert "| 2026-01-24 | 2026-01-26 | 1 |" in out
+    assert "1 repeated value" in out
+    assert "| 2026-01-05 | 2 |" in out
+
+
+def test_check_coverage_agrees_with_a_direct_count(session, settings, coverage_dir):
+    """The missing total must match what an explicit calendar join finds."""
+    import duckdb
+
+    path = (coverage_dir / "daily.parquet").as_posix()
+    con = duckdb.connect(":memory:")
+    actual = con.sql(f"""
+        WITH present AS (SELECT DISTINCT day FROM '{path}'),
+             span AS (SELECT min(day) lo, max(day) hi FROM present),
+             calendar AS (
+                 SELECT unnest(generate_series(lo, hi, INTERVAL 1 DAY))::DATE AS day FROM span
+             )
+        SELECT count(*) FROM calendar WHERE day NOT IN (SELECT day FROM present)
+    """).fetchone()[0]
+    con.close()
+    assert f"**{actual} missing**" in check_coverage(session, settings, path, "day")
+
+
+def test_check_coverage_is_quiet_on_a_complete_series(session, settings, coverage_dir):
+    out = check_coverage(session, settings, (coverage_dir / "clean.parquet").as_posix(), "day")
+    assert "No gaps and no repeats" in out
+    assert "missing" not in out.lower().split("no gaps")[0]
+
+
+def test_check_coverage_tolerates_uneven_calendar_steps(session, settings, coverage_dir):
+    """Months are 28-31 days; only the real hole counts, not the short months."""
+    out = check_coverage(session, settings, (coverage_dir / "monthly.parquet").as_posix(), "month")
+    assert "**1 missing**" in out
+    assert "| 2026-06-01 | 2026-08-01 | 1 |" in out
+    assert body_rows(out) == 1  # exactly one gap row, no February noise
+
+
+def test_check_coverage_handles_an_integer_sequence(session, settings, coverage_dir):
+    out = check_coverage(session, settings, (coverage_dir / "seq.parquet").as_posix(), "seq")
+    assert "**2 missing**" in out
+    assert "| 41 | 44 | 2 |" in out
+
+
+def test_check_coverage_buckets_timestamps(session, settings, coverage_dir):
+    """Timestamps carrying a time of day still describe a daily series."""
+    path = (coverage_dir / "daily.parquet").as_posix()
+    out = check_coverage(session, settings, path, "ts", granularity="day")
+    assert "by day" in out
+    assert "**3 missing**" in out
+    assert "2026-01-08 00:00:00" in out
+
+
+def test_check_coverage_rejects_a_column_with_no_step(session, settings, coverage_dir):
+    with pytest.raises(ToolError, match="no regular step"):
+        check_coverage(session, settings, (coverage_dir / "text.parquet").as_posix(), "label")
+
+
+def test_check_coverage_handles_degenerate_columns(session, settings, coverage_dir):
+    nulls = check_coverage(session, settings, (coverage_dir / "nulls.parquet").as_posix(), "day")
+    assert "Every row is NULL" in nulls
+    one = check_coverage(session, settings, (coverage_dir / "one.parquet").as_posix(), "day")
+    assert "Only one distinct value" in one
+
+
+def test_check_coverage_validates_its_arguments(session, settings, coverage_dir):
+    path = (coverage_dir / "daily.parquet").as_posix()
+    with pytest.raises(ToolError, match="no column named"):
+        check_coverage(session, settings, path, "nope")
+    with pytest.raises(ToolError, match="Unknown granularity"):
+        check_coverage(session, settings, path, "day", granularity="fortnight")
+    with pytest.raises(ToolError, match="only applies to dates"):
+        check_coverage(
+            session, settings, (coverage_dir / "seq.parquet").as_posix(), "seq", granularity="day"
+        )
+
+
+def test_check_coverage_counts_nulls_separately(session, settings, tmp_path):
+    """NULL rows are neither present nor missing; they need saying out loud."""
+    import duckdb
+
+    path = (tmp_path / "gappy.parquet").as_posix()
+    con = duckdb.connect(":memory:")
+    con.execute(f"""COPY (
+        SELECT day::DATE AS day
+        FROM generate_series(DATE '2026-01-01', DATE '2026-01-10', INTERVAL 1 DAY) t(day)
+        UNION ALL SELECT NULL FROM range(4)
+    ) TO '{path}'""")
+    con.close()
+    out = check_coverage(session, settings, path, "day")
+    assert "4 NULL rows" in out
 
 
 def test_join_across_formats(session, settings, data_dir):
