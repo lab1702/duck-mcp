@@ -55,6 +55,11 @@ SMALL_FILE_BYTES = 16 * 1024 * 1024
 # count. Past this many it compares a spread instead of every file.
 COMPARE_MAX_FILES = 100
 
+# find_value adds one conditional aggregate per column to a single query.
+SEARCH_MAX_COLUMNS = 60
+
+_GLOB_CHARS = ("*", "?", "[")
+
 # Type names are interpolated into a cast to ask DuckDB how two of them
 # reconcile, so anything that is not plainly a type name is not interpolated.
 # STRUCT(a INTEGER) and DECIMAL(10,2) pass; a quoted field name does not, and
@@ -989,6 +994,371 @@ def _multi_file_reader(path: str) -> str | None:
         if ext == candidate:
             return reader
     return None
+
+
+# --------------------------------------------------------------------------
+# check_join
+# --------------------------------------------------------------------------
+
+
+def check_join(
+    session: DuckDBSession,
+    settings: Settings,
+    left: str,
+    right: str,
+    left_on: Sequence[str] | str,
+    right_on: Sequence[str] | str | None = None,
+) -> str:
+    """Report what joining two files on these keys will do, before doing it.
+
+    A join whose right side holds duplicate keys quietly multiplies the left
+    side's rows, and every sum over the result comes out inflated -- with no
+    error, and a total that still looks plausible. The counts here come from
+    grouped key counts, so the join itself is never materialised.
+    """
+    left_keys = [left_on] if isinstance(left_on, str) else list(left_on)
+    right_keys = list(left_keys) if right_on is None else (
+        [right_on] if isinstance(right_on, str) else list(right_on)
+    )
+    if not left_keys:
+        raise ToolError("left_on must name at least one column.")
+    if len(left_keys) != len(right_keys):
+        raise ToolError(
+            f"left_on has {len(left_keys)} column(s) but right_on has {len(right_keys)}; "
+            "they must line up."
+        )
+
+    budget = session.budget()
+    left_src, right_src = source_expr(left), source_expr(right)
+    left_types = _key_types(session, left_src, left_keys, left, budget=budget)
+    right_types = _key_types(session, right_src, right_keys, right, budget=budget)
+
+    aliases = [f"k{index}" for index in range(len(left_keys))]
+    mismatched = [
+        f"{lhs} is {left_types[lhs]} but {rhs} is {right_types[rhs]}"
+        for lhs, rhs in zip(left_keys, right_keys)
+        if left_types[lhs] != right_types[rhs]
+    ]
+    try:
+        stats = _join_stats(session, left_src, right_src, left_keys, right_keys, aliases, budget)
+    except ToolError as exc:
+        # Joining across types makes DuckDB cast one side, which fails on the
+        # first value that will not convert. The cast is the cause, so say so
+        # rather than passing on a bare conversion error about one value.
+        if mismatched:
+            raise ToolError(
+                "The key types do not match: " + "; ".join(mismatched) + ". DuckDB casts one "
+                f"side to the other and that failed ({exc}). Join on an explicit cast in "
+                "`query` if one side really is a stringified form of the other."
+            ) from exc
+        raise
+
+    pairs = ", ".join(
+        f"{lhs} = {rhs}" if lhs != rhs else lhs for lhs, rhs in zip(left_keys, right_keys)
+    )
+    header = f"**{left}** ⋈ **{right}** on {pairs}"
+
+    rows = [
+        _join_side("left", stats, "l"),
+        _join_side("right", stats, "r"),
+    ]
+    table, _ = to_markdown_table(
+        ["side", "rows", "distinct keys", "max rows per key", "matched", "unmatched", "null keys"],
+        rows,
+        max_bytes=settings.max_bytes,
+    )
+
+    parts = [header, table]
+    parts.extend(_join_findings(stats, left_keys, right_keys, mismatched))
+    return "\n\n".join(part for part in parts if part)
+
+
+def _key_types(
+    session: DuckDBSession,
+    source: str,
+    keys: Sequence[str],
+    path: str,
+    *,
+    budget: TimeBudget,
+) -> dict[str, str]:
+    """Resolve the key columns' types, refusing names the file does not have."""
+    described = {name: ctype for name, ctype, _ in _describe(session, source, budget=budget)}
+    missing = [key for key in keys if key not in described]
+    if missing:
+        raise ToolError(
+            f"{path} has no column(s) named {', '.join(missing)}. "
+            f"Available: {', '.join(described)}"
+        )
+    return {key: described[key] for key in keys}
+
+
+def _join_stats(
+    session: DuckDBSession,
+    left_src: str,
+    right_src: str,
+    left_keys: Sequence[str],
+    right_keys: Sequence[str],
+    aliases: Sequence[str],
+    budget: TimeBudget,
+) -> dict[str, int]:
+    """Every figure the report needs, from one query and one scan per side."""
+    group_by = ", ".join(str(index + 1) for index in range(len(aliases)))
+    not_null = " AND ".join(f"{alias} IS NOT NULL" for alias in aliases)
+    any_null = " OR ".join(f"{alias} IS NULL" for alias in aliases)
+    using = ", ".join(aliases)
+
+    def grouped(source: str, keys: Sequence[str]) -> str:
+        selected = ", ".join(
+            f"{quote_ident(key)} AS {alias}" for key, alias in zip(keys, aliases)
+        )
+        return f"SELECT {selected}, count(*) AS n FROM {source} GROUP BY {group_by}"
+
+    _, rows = _run(
+        session,
+        f"""WITH l AS ({grouped(left_src, left_keys)}),
+                 r AS ({grouped(right_src, right_keys)}),
+                 m AS (SELECT l.n AS ln, r.n AS rn FROM l JOIN r USING ({using}))
+            SELECT
+                (SELECT coalesce(sum(n), 0) FROM l),
+                (SELECT count(*) FROM l WHERE {not_null}),
+                (SELECT coalesce(sum(n), 0) FROM l WHERE {any_null}),
+                (SELECT coalesce(max(n), 0) FROM l WHERE {not_null}),
+                (SELECT coalesce(sum(n), 0) FROM r),
+                (SELECT count(*) FROM r WHERE {not_null}),
+                (SELECT coalesce(sum(n), 0) FROM r WHERE {any_null}),
+                (SELECT coalesce(max(n), 0) FROM r WHERE {not_null}),
+                (SELECT coalesce(sum(ln), 0) FROM m),
+                (SELECT coalesce(sum(rn), 0) FROM m),
+                (SELECT coalesce(sum(ln * rn), 0) FROM m),
+                (SELECT count(*) FROM m)""",
+        budget=budget,
+    )
+    # Same order as the SELECT list above.
+    fields = (
+        "l_rows", "l_keys", "l_null", "l_max",
+        "r_rows", "r_keys", "r_null", "r_max",
+        "l_matched", "r_matched", "out_rows", "matched_keys",
+    )
+    return {name: int(value or 0) for name, value in zip(fields, rows[0])}
+
+
+def _join_side(side: str, stats: dict[str, int], prefix: str) -> list[Any]:
+    total = stats[f"{prefix}_rows"]
+    matched = stats[f"{prefix}_matched"]
+    share = f" ({matched / total * 100:.1f}%)" if total else ""
+    return [
+        side,
+        f"{total:,}",
+        f"{stats[f'{prefix}_keys']:,}",
+        f"{stats[f'{prefix}_max']:,}",
+        f"{matched:,}{share}",
+        f"{total - matched:,}",
+        f"{stats[f'{prefix}_null']:,}",
+    ]
+
+
+def _join_findings(
+    stats: dict[str, int],
+    left_keys: Sequence[str],
+    right_keys: Sequence[str],
+    mismatched: Sequence[str],
+) -> list[str]:
+    """Name the relationship, then whatever about it will bite."""
+    findings = []
+    left_max, right_max = stats["l_max"], stats["r_max"]
+
+    if stats["matched_keys"] == 0:
+        findings.append("**No rows match at all.**")
+        if stats["l_rows"] and stats["l_null"] == stats["l_rows"]:
+            findings.append(
+                f"Every left row has a NULL key, and NULL never matches. "
+                f"Check that {', '.join(left_keys)} is the column you meant."
+            )
+        elif mismatched:
+            findings.append("The key types differ: " + "; ".join(mismatched) + ".")
+        else:
+            findings.append("The key columns share no values; they may not be related.")
+        return findings
+
+    relationship = {
+        (False, False): "one-to-one",
+        (True, False): "many-to-one (a safe lookup)",
+        (False, True): "one-to-many",
+        (True, True): "many-to-many",
+    }[(left_max > 1, right_max > 1)]
+    findings.append(
+        f"Relationship: **{relationship}** — up to {left_max:,} left "
+        f"{_plural(left_max, 'row')} and {right_max:,} right "
+        f"{_plural(right_max, 'row')} per key. "
+        f"The join yields {stats['out_rows']:,} rows from {stats['l_rows']:,} on the left."
+    )
+    if mismatched:
+        findings.append(
+            "The key types differ (" + "; ".join(mismatched) + "), so DuckDB is casting one "
+            "side to the other. It works on these values but will fail on the first that "
+            "cannot convert."
+        )
+
+    if right_max > 1:
+        findings.append(
+            f"**Rows are duplicated.** The right side holds up to {right_max:,} rows per key, "
+            f"so each matching left row is repeated. Any sum or count over the left side's "
+            f"columns comes out inflated — {stats['out_rows']:,} rows rather than "
+            f"{stats['l_rows']:,}. Aggregate the right side down to one row per key first, "
+            "or count DISTINCT on a left-side identifier."
+        )
+
+    for side, keys in (("left", left_keys), ("right", right_keys)):
+        prefix = "l" if side == "left" else "r"
+        unmatched = stats[f"{prefix}_rows"] - stats[f"{prefix}_matched"]
+        if unmatched:
+            share = unmatched / stats[f"{prefix}_rows"] * 100
+            findings.append(
+                f"{unmatched:,} {side} {_plural(unmatched, 'row')} ({share:.1f}%) match "
+                f"nothing and an inner join "
+                f"drops them; use a {'LEFT' if side == 'left' else 'RIGHT'} JOIN to keep them."
+            )
+        if stats[f"{prefix}_null"]:
+            findings.append(
+                f"{stats[f'{prefix}_null']:,} {side} {_plural(stats[f'{prefix}_null'], 'row')} "
+                f"have a NULL key, which never "
+                "matches — they are part of the unmatched count above."
+            )
+    return findings
+
+
+# --------------------------------------------------------------------------
+# find_value
+# --------------------------------------------------------------------------
+
+
+def find_value(
+    session: DuckDBSession,
+    settings: Settings,
+    path: str,
+    value: str,
+    columns: Sequence[str] | None = None,
+    exact: bool = False,
+) -> str:
+    """Find which columns -- and which files -- contain a value.
+
+    For answering "where does this identifier live?" in a dataset whose schema
+    you do not know yet, which is exactly when you cannot write the query
+    yourself. Every column is compared as text, so one pass covers every type.
+    """
+    if not value:
+        raise ToolError("value must not be empty.")
+
+    budget = session.budget()
+    source = source_expr(path)
+    described = _describe(session, source, budget=budget)
+    types = {name: ctype for name, ctype, _ in described}
+    if columns:
+        missing = [name for name in columns if name not in types]
+        if missing:
+            raise ToolError(
+                f"Unknown column(s): {', '.join(missing)}. Available: {', '.join(types)}"
+            )
+        selected = list(columns)
+    else:
+        selected = [name for name, _, _ in described]
+
+    dropped = max(0, len(selected) - SEARCH_MAX_COLUMNS)
+    selected = selected[:SEARCH_MAX_COLUMNS]
+    if not selected:
+        raise ToolError(f"{path} has no columns to search.")
+
+    # % and _ are LIKE wildcards, so a value containing them would quietly
+    # match far more than the caller asked for.
+    escaped = value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    pattern = escaped if exact else f"%{escaped}%"
+    literal = sql_string(pattern)
+
+    by_file = _filename_reader(path) if any(ch in path for ch in _GLOB_CHARS) else None
+    scan = by_file or source
+
+    tests = []
+    for name in selected:
+        cast = f"{quote_ident(name)}::VARCHAR"
+        tests.append(f"count(*) FILTER ({cast} ILIKE {literal} ESCAPE '\\')")
+        tests.append(f"min({cast}) FILTER ({cast} ILIKE {literal} ESCAPE '\\')")
+
+    if by_file:
+        _, fetched = _run(
+            session,
+            f"SELECT filename, count(*), {', '.join(tests)} FROM {scan} GROUP BY 1 ORDER BY 1",
+            budget=budget,
+        )
+    else:
+        _, fetched = _run(
+            session, f"SELECT NULL, count(*), {', '.join(tests)} FROM {scan}", budget=budget
+        )
+    if not fetched:
+        return f"**{path}** — no rows to search."
+
+    counts: dict[str, int] = {name: 0 for name in selected}
+    examples: dict[str, str] = {}
+    per_file: list[tuple[str, int]] = []
+    scanned = 0
+    for row in fetched:
+        scanned += int(row[1] or 0)
+        hits = 0
+        for index, name in enumerate(selected):
+            count = int(row[2 + index * 2] or 0)
+            counts[name] += count
+            hits += count
+            sample = row[3 + index * 2]
+            if count and name not in examples and sample is not None:
+                examples[name] = str(sample)
+        if row[0] is not None:
+            per_file.append((os.path.basename(str(row[0]).replace("\\", "/")), hits))
+
+    matched = [name for name in selected if counts[name]]
+    kind = "exact match" if exact else "case-insensitive substring"
+    header = (
+        f"**{path}** — searched {scanned:,} rows of {len(selected)} "
+        f"{_plural(len(selected), 'column')} for {value!r} ({kind})"
+    )
+    if dropped:
+        header += f"; {dropped} further {_plural(dropped, 'column')} not searched"
+
+    if not matched:
+        return (
+            f"{header}\n\nNo column contains that value."
+            + ("" if exact else " Try `exact=False` variants, or check the spelling.")
+        )
+
+    records = [
+        [name, types.get(name, ""), f"{counts[name]:,}", format_cell(examples.get(name, "—"))]
+        for name in sorted(matched, key=lambda name: (-counts[name], name))
+    ]
+    table, emitted = to_markdown_table(
+        ["column", "type", "matches", "example"], records, max_bytes=settings.max_bytes
+    )
+    parts = [header, table]
+    note = truncation_note(emitted, len(records), settings.max_bytes, unit="columns")
+    if note:
+        parts.append(note)
+
+    hits_by_file = [entry for entry in per_file if entry[1]]
+    if by_file and len(per_file) > 1:
+        listed, _ = to_markdown_table(
+            ["file", "matches"],
+            [[name, f"{hits:,}"] for name, hits in hits_by_file[: settings.max_rows]],
+            max_bytes=settings.max_bytes,
+        )
+        parts.append(
+            f"Found in {len(hits_by_file)} of {len(per_file)} files:\n\n{listed}"
+            if hits_by_file
+            else ""
+        )
+    return "\n\n".join(part for part in parts if part)
+
+
+def _filename_reader(path: str) -> str | None:
+    """A reader call that adds a ``filename`` column, so matches can be located."""
+    reader = _multi_file_reader(path)
+    return None if reader is None else f"{reader}({sql_string(path)}, filename=true)"
 
 
 def _top_values(

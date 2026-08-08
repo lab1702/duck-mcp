@@ -11,8 +11,10 @@ from duckdb_mcp.config import HARD_MAX_ROWS
 from duckdb_mcp.db import ReadOnlyViolation
 from duckdb_mcp.tools import (
     ToolError,
+    check_join,
     compare_schemas,
     describe_file,
+    find_value,
     inspect_raw,
     list_files,
     parquet_metadata,
@@ -777,6 +779,251 @@ def test_compare_schemas_survives_an_unreadable_file(session, settings, tmp_path
 def test_compare_schemas_reports_no_match(session, settings, tmp_path):
     with pytest.raises(ToolError, match="No files matched"):
         compare_schemas(session, settings, (tmp_path / "*.parquet").as_posix())
+
+
+@pytest.fixture(scope="session")
+def join_dir(tmp_path_factory):
+    """Order/customer files shaped to exercise each join pathology."""
+    import duckdb
+
+    directory = tmp_path_factory.mktemp("joins")
+    con = duckdb.connect(":memory:")
+
+    def write(name, select):
+        con.execute(f"COPY ({select}) TO '{(directory / name).as_posix()}'")
+
+    # 1,000 orders over 200 customers, five orders each.
+    write("orders.parquet",
+          "SELECT i AS order_id, (i % 200)+1 AS customer_id, 10.0 AS amount FROM range(1000) t(i)")
+    # 200 customers, but 20 of them listed twice -- the fan-out.
+    write("dupes.parquet",
+          "SELECT i+1 AS id, 'c' AS name FROM range(200) t(i) "
+          "UNION ALL SELECT i+1, 'dupe' FROM range(20) t(i)")
+    write("clean.parquet", "SELECT i+1 AS id, 'c' AS name FROM range(200) t(i)")
+    # Only 100 customers, so half the orders match nothing.
+    write("partial.parquet", "SELECT i+1 AS id FROM range(100) t(i)")
+    write("orphans.parquet", "SELECT 9000+i AS order_id, 9000+i AS customer_id FROM range(30) t(i)")
+    write("nullkeys.parquet", "SELECT i AS id, NULL::INT AS cust FROM range(10) t(i)")
+    write("strkeys.parquet", "SELECT i AS id, ('c' || i) AS cust FROM range(10) t(i)")
+    con.close()
+    return directory
+
+
+def test_check_join_flags_the_fan_out(session, settings, join_dir):
+    """The silent bug: duplicate keys on the right inflate every aggregate."""
+    out = check_join(
+        session, settings,
+        (join_dir / "orders.parquet").as_posix(),
+        (join_dir / "dupes.parquet").as_posix(),
+        ["customer_id"], ["id"],
+    )
+    assert "many-to-many" in out
+    assert "Rows are duplicated" in out
+    assert "1,100 rows rather than 1,000" in out
+
+
+def test_check_join_predicts_the_row_count_exactly(session, settings, join_dir):
+    """The headline number must match the join it declines to run."""
+    import duckdb
+
+    left = (join_dir / "orders.parquet").as_posix()
+    right = (join_dir / "dupes.parquet").as_posix()
+    out = check_join(session, settings, left, right, ["customer_id"], ["id"])
+
+    con = duckdb.connect(":memory:")
+    actual = con.sql(
+        f"SELECT count(*) FROM '{left}' a JOIN '{right}' b ON a.customer_id = b.id"
+    ).fetchone()[0]
+    con.close()
+    assert f"yields {actual:,} rows" in out
+
+
+def test_check_join_approves_a_clean_lookup(session, settings, join_dir):
+    out = check_join(
+        session, settings,
+        (join_dir / "orders.parquet").as_posix(),
+        (join_dir / "clean.parquet").as_posix(),
+        ["customer_id"], ["id"],
+    )
+    assert "many-to-one (a safe lookup)" in out
+    assert "Rows are duplicated" not in out
+    assert "match nothing" not in out
+
+
+def test_check_join_reports_unmatched_rows(session, settings, join_dir):
+    out = check_join(
+        session, settings,
+        (join_dir / "orders.parquet").as_posix(),
+        (join_dir / "partial.parquet").as_posix(),
+        ["customer_id"], ["id"],
+    )
+    assert "500 left rows (50.0%) match nothing" in out
+    assert "LEFT JOIN" in out
+
+
+def test_check_join_reports_no_overlap(session, settings, join_dir):
+    out = check_join(
+        session, settings,
+        (join_dir / "orphans.parquet").as_posix(),
+        (join_dir / "clean.parquet").as_posix(),
+        ["customer_id"], ["id"],
+    )
+    assert "No rows match at all" in out
+    assert "share no values" in out
+
+
+def test_check_join_explains_an_all_null_key(session, settings, join_dir):
+    out = check_join(
+        session, settings,
+        (join_dir / "nullkeys.parquet").as_posix(),
+        (join_dir / "clean.parquet").as_posix(),
+        ["cust"], ["id"],
+    )
+    assert "No rows match at all" in out
+    assert "NULL never matches" in out
+
+
+def test_check_join_explains_a_type_mismatch(session, settings, join_dir):
+    """DuckDB's own error names one stray value; the cause is the type pairing."""
+    with pytest.raises(ToolError) as excinfo:
+        check_join(
+            session, settings,
+            (join_dir / "strkeys.parquet").as_posix(),
+            (join_dir / "clean.parquet").as_posix(),
+            ["cust"], ["id"],
+        )
+    message = str(excinfo.value)
+    assert "key types do not match" in message
+    assert "VARCHAR" in message and "BIGINT" in message
+
+
+def test_check_join_supports_composite_keys(session, settings, tmp_path):
+    import duckdb
+
+    con = duckdb.connect(":memory:")
+    left = (tmp_path / "l.parquet").as_posix()
+    right = (tmp_path / "r.parquet").as_posix()
+    con.execute(
+        f"COPY (SELECT i AS a, i % 3 AS b FROM range(30) t(i)) TO '{left}'"
+    )
+    con.execute(
+        f"COPY (SELECT i AS a, i % 3 AS b FROM range(15) t(i)) TO '{right}'"
+    )
+    actual = con.sql(
+        f"SELECT count(*) FROM '{left}' x JOIN '{right}' y ON x.a=y.a AND x.b=y.b"
+    ).fetchone()[0]
+    con.close()
+
+    out = check_join(session, settings, left, right, ["a", "b"], ["a", "b"])
+    assert f"yields {actual:,} rows" in out
+    assert "one-to-one" in out
+
+
+def test_check_join_rejects_unknown_columns(session, settings, join_dir):
+    with pytest.raises(ToolError, match="no column"):
+        check_join(
+            session, settings,
+            (join_dir / "orders.parquet").as_posix(),
+            (join_dir / "clean.parquet").as_posix(),
+            ["nope"], ["id"],
+        )
+
+
+def test_check_join_rejects_mismatched_key_counts(session, settings, join_dir):
+    with pytest.raises(ToolError, match="line up"):
+        check_join(
+            session, settings,
+            (join_dir / "orders.parquet").as_posix(),
+            (join_dir / "clean.parquet").as_posix(),
+            ["customer_id", "amount"], ["id"],
+        )
+
+
+def test_check_join_defaults_right_keys_to_left(session, settings, tmp_path):
+    import duckdb
+
+    con = duckdb.connect(":memory:")
+    for name in ("a.parquet", "b.parquet"):
+        con.execute(f"COPY (SELECT i AS id FROM range(5) t(i)) TO '{(tmp_path / name).as_posix()}'")
+    con.close()
+    out = check_join(
+        session, settings,
+        (tmp_path / "a.parquet").as_posix(), (tmp_path / "b.parquet").as_posix(), ["id"],
+    )
+    assert "one-to-one" in out
+
+
+@pytest.fixture(scope="session")
+def search_dir(tmp_path_factory):
+    import duckdb
+
+    directory = tmp_path_factory.mktemp("search")
+    con = duckdb.connect(":memory:")
+    con.execute(
+        "COPY (SELECT i+1 AS id, 'cust-' || (i+1) AS name, 'ACME 50% off' AS note "
+        f"FROM range(20) t(i)) TO '{(directory / 'customers.parquet').as_posix()}'"
+    )
+    parts = directory / "parts"
+    parts.mkdir()
+    for index in range(3):
+        con.execute(
+            f"COPY (SELECT {index}*100+i AS id, "
+            f"CASE WHEN {index}=1 AND i=0 THEN 'NEEDLE' ELSE 'x' END AS tag "
+            f"FROM range(5) t(i)) TO '{(parts / f'p{index}.parquet').as_posix()}'"
+        )
+    con.close()
+    return directory
+
+
+def test_find_value_locates_the_column(session, settings, search_dir):
+    out = find_value(session, settings, (search_dir / "customers.parquet").as_posix(), "cust-7")
+    assert "| name |" in out
+    assert "cust-7" in row_for(out, "name")
+    assert "| note |" not in out  # columns without a match are left out
+
+
+def test_find_value_treats_percent_as_a_literal(session, settings, search_dir):
+    """'%' is a LIKE wildcard; unescaped it would match every row."""
+    path = (search_dir / "customers.parquet").as_posix()
+    assert "| note |" in find_value(session, settings, path, "50%")
+    assert "No column contains" in find_value(session, settings, path, "%zz%")
+
+
+def test_find_value_searches_non_text_columns(session, settings, search_dir):
+    out = find_value(session, settings, (search_dir / "customers.parquet").as_posix(), "17")
+    assert "| id |" in out  # an INTEGER column, matched as text
+
+
+def test_find_value_exact_mode(session, settings, search_dir):
+    path = (search_dir / "customers.parquet").as_posix()
+    assert "| name |" in find_value(session, settings, path, "cust-7", exact=True)
+    # A substring alone must not satisfy an exact search.
+    assert "No column contains" in find_value(session, settings, path, "cust", exact=True)
+
+
+def test_find_value_reports_which_file(session, settings, search_dir):
+    out = find_value(session, settings, (search_dir / "parts" / "*.parquet").as_posix(), "NEEDLE")
+    assert "Found in 1 of 3 files" in out
+    assert "p1.parquet" in out
+
+
+def test_find_value_says_when_absent(session, settings, search_dir):
+    out = find_value(session, settings, (search_dir / "customers.parquet").as_posix(), "zzz")
+    assert "No column contains that value" in out
+
+
+def test_find_value_restricts_to_named_columns(session, settings, search_dir):
+    path = (search_dir / "customers.parquet").as_posix()
+    out = find_value(session, settings, path, "7", columns=["name"])
+    assert "| name |" in out
+    assert "| id |" not in out
+    with pytest.raises(ToolError, match="Unknown column"):
+        find_value(session, settings, path, "7", columns=["nope"])
+
+
+def test_find_value_rejects_an_empty_value(session, settings, search_dir):
+    with pytest.raises(ToolError, match="must not be empty"):
+        find_value(session, settings, (search_dir / "customers.parquet").as_posix(), "")
 
 
 def test_join_across_formats(session, settings, data_dir):

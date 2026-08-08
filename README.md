@@ -77,6 +77,8 @@ No clone, no virtualenv, no `pip install`. To pick up a new release, run
 | `profile_columns(path, columns=None, top_k=5)` | Null counts, approximate distinct counts, min/max and most-frequent values. |
 | `parquet_metadata(path, row_groups=False)` | Parquet layout from the footer: sizes, compression, row-group pruning — no scan. |
 | `compare_schemas(path, max_files=100)` | Compare schemas across a glob and say what a plain read does about the differences. |
+| `check_join(left, right, left_on, right_on=None)` | What a join will do before you run it: fan-out, match rates, orphans. |
+| `find_value(path, value, columns=None, exact=False)` | Which columns — and which files — contain a value. |
 
 Files are referenced by path directly in SQL — there is no import or
 registration step:
@@ -247,6 +249,53 @@ than the first N — drift tends to track write order, so the first N files
 would be the oldest and would miss exactly the recent change worth finding.
 The first and last file are always included. Files that cannot be read at all
 are reported rather than skipped silently.
+
+### Checking a join before trusting it
+
+If the right side of a join holds more than one row per key, the join
+duplicates left rows and every aggregate over the result is inflated. There is
+no error, and the total still looks plausible:
+
+```
+sum(amount) alone      = 10000.0
+sum(amount) after join = 11000.0     <- 20 duplicate customer ids
+```
+
+`check_join` reports that from grouped key counts, without materialising the
+join:
+
+```
+**orders.parquet** ⋈ **customers.parquet** on customer_id = id
+
+| side  | rows  | distinct keys | max rows per key | matched        | unmatched | null keys |
+| ----- | ----- | ------------- | ---------------- | -------------- | --------- | --------- |
+| left  | 1,000 | 200           | 5                | 1,000 (100.0%) | 0         | 0         |
+| right | 220   | 200           | 2                | 220 (100.0%)   | 0         | 0         |
+
+Relationship: many-to-many — up to 5 left rows and 2 right rows per key.
+The join yields 1,100 rows from 1,000 on the left.
+```
+
+Direction is what matters: five orders per customer is normal, two customer
+rows per id is the bug. So `many-to-one` is reported as a safe lookup while
+`many-to-many` gets a warning. The predicted row count is exact — a test
+asserts it against the join it declined to run.
+
+It also reports rows that match nothing, so you can see an inner join dropping
+half your data, and diagnoses a join returning nothing at all: keys that are
+entirely NULL, or key columns whose types cannot be compared.
+
+### Finding where a value lives
+
+```
+find_value('data/*.parquet', 'NEEDLE')
+```
+
+Searches every column as text — numbers, dates and nested values included —
+and reports which columns match, with an example, plus which files they are
+in. Useful for locating a join key in a dataset whose schema you do not know
+yet, which is exactly when you cannot write the query yourself. `%` and `_` in
+the search value are matched literally rather than as wildcards.
 
 ## Remote files
 

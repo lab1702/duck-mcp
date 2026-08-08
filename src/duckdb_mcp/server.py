@@ -40,6 +40,11 @@ Before trusting a query over a glob of many files, `compare_schemas` checks
 that they agree. Files that disagree are not reliably an error: DuckDB adopts
 the first file's schema, silently dropping a column the others add and silently
 narrowing values its types cannot hold.
+
+Before aggregating over a join, `check_join` says what it will do -- a right
+side with repeated keys duplicates left rows and inflates every sum, again
+without an error. `find_value` locates which column and file hold a value when
+the schema is not yet known.
 """
 
 settings = Settings.from_env()
@@ -212,6 +217,57 @@ async def compare_schemas(path: str, max_files: int | None = None) -> str:
             across the glob rather than taken from the front).
     """
     return await _call(tools.compare_schemas, get_session(), settings, path, max_files)
+
+
+@mcp.tool()
+async def check_join(
+    left: str,
+    right: str,
+    left_on: list[str],
+    right_on: list[str] | None = None,
+) -> str:
+    """Check what joining two files on these keys will do, before running it.
+
+    Run this before any join you are about to aggregate over. If the right side
+    holds more than one row per key, the join silently duplicates left rows and
+    every sum over the result is inflated -- no error, and a total that still
+    looks reasonable. Also reports how many rows on each side match nothing, so
+    you can tell whether an inner join is quietly dropping data.
+
+    Args:
+        left: Left file path, glob or URL.
+        right: Right file path, glob or URL.
+        left_on: Key column(s) in the left file.
+        right_on: Key column(s) in the right file (defaults to left_on).
+    """
+    return await _call(
+        tools.check_join, get_session(), settings, left, right, left_on, right_on
+    )
+
+
+@mcp.tool()
+async def find_value(
+    path: str,
+    value: str,
+    columns: list[str] | None = None,
+    exact: bool = False,
+) -> str:
+    """Find which columns, and which files, contain a value.
+
+    Use this when you know a value but not where it lives -- locating a join
+    key across unfamiliar files, or confirming an identifier is present at all.
+    Every column is compared as text, so numbers, dates and nested values are
+    all searched. This scans the whole file.
+
+    Args:
+        path: File path, glob or URL.
+        value: The value to look for.
+        columns: Restrict the search to these columns (default: all).
+        exact: Match the whole value instead of any substring of it.
+    """
+    return await _call(
+        tools.find_value, get_session(), settings, path, value, columns, exact
+    )
 
 
 def _positive_int(text: str) -> int:
