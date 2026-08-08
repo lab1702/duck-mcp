@@ -75,6 +75,7 @@ No clone, no virtualenv, no `pip install`. To pick up a new release, run
 | `inspect_raw(path, lines=20)` | Raw lines of a text file, before parsing, plus what the CSV sniffer detected. |
 | `list_files(path, pattern="*", recursive=False)` | List readable data files in a directory or `s3://` prefix. |
 | `profile_columns(path, columns=None, top_k=5)` | Null counts, approximate distinct counts, min/max and most-frequent values. |
+| `parquet_metadata(path, row_groups=False)` | Parquet layout from the footer: sizes, compression, row-group pruning — no scan. |
 
 Files are referenced by path directly in SQL — there is no import or
 registration step:
@@ -152,6 +153,52 @@ multi-gigabyte file, and it tolerates input a real parse rejects — mixed line
 endings, unterminated quotes, ragged rows. Tabs, carriage returns and other
 invisible characters are escaped so they can be seen. It is text-only; parquet
 and Excel are rejected with a pointer to `describe_file`.
+
+### Parquet layout
+
+Everything else here reads data. `parquet_metadata` reads the footer, so it
+answers layout questions on a file far too large to profile — and answers
+"how many rows?" for free, since parquet records that in metadata:
+
+```
+**events/*.parquet** — 12 parquet file(s), 4,500,000 rows, 45 row group(s), 210.5MB on disk
+
+| column | type | codec | compressed | ratio | nulls | row_group_order |
+| ------ | ---- | ----- | ---------- | ----- | ----- | --------------- |
+| id     | INT64      | SNAPPY | 1.1MB  | 2.0x  | 0       | ascending       |
+| ts     | INT64      | SNAPPY | 1.7MB  | 1.3x  | 0       | ascending       |
+| label  | BYTE_ARRAY | SNAPPY | 1.4MB  | 3.4x  | 0       | ascending       |
+| bucket | INT64      | SNAPPY | 6.7KB  | 16.7x | 0       | scattered (9/9) |
+| notes  | BYTE_ARRAY | SNAPPY | 290B   | 0.9x  | 300,000 | no stats        |
+```
+
+`row_group_order` is the useful part. A parquet reader skips a row group when
+its recorded min/max cannot match the filter, so a range filter is cheap on a
+column whose row-group ranges climb through the file (`ascending`) and reads
+everything on one whose ranges overlap (`scattered`). Above, filtering on `ts`
+prunes; filtering on `bucket` — which cycles through the same seven values in
+every row group — cannot. `no stats` means the column records no min/max at
+all, so nothing can be inferred either way.
+
+Comparisons are numeric when both bounds parse as numbers and lexicographic
+otherwise, which is what parquet itself does for strings and matches the
+ISO-8601 text DuckDB gives timestamps.
+
+The tool also flags layouts that make scans cost more than the data warrants —
+undersized row groups, or a glob of many small files:
+
+```
+Note: row groups average only 1,000 rows. Small row groups add per-group
+overhead and give the reader less to parallelise over; 128MB-ish groups are
+the usual target.
+
+Note: 4 files averaging 4.3KB each. Many small files cost one open per file,
+which dominates on object storage.
+```
+
+`row_groups=True` adds a per-row-group table of row counts and sizes, for
+finding uneven splits. Actual value ranges are not reported here — footer
+statistics are approximate by design; use `profile_columns` for real min/max.
 
 ## Remote files
 

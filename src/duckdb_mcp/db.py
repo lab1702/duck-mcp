@@ -38,14 +38,19 @@ _COMPRESSION_SUFFIXES = (".gz", ".zst", ".bz2", ".br")
 
 CSV_EXTS = {".csv", ".tsv", ".tab", ".txt"}
 _JSON_EXTS = {".json", ".ndjson", ".jsonl"}
-_PARQUET_EXTS = {".parquet", ".pq"}
+PARQUET_EXTS = {".parquet", ".pq"}
 _EXCEL_EXTS = {".xlsx", ".xlsm", ".xls"}
 
-READABLE_EXTS = CSV_EXTS | _JSON_EXTS | _PARQUET_EXTS | _EXCEL_EXTS
+READABLE_EXTS = CSV_EXTS | _JSON_EXTS | PARQUET_EXTS | _EXCEL_EXTS
 
 # Container formats: readable, but not as lines of text. A raw peek at one
 # gets a CSV-parser error rather than anything useful, so callers refuse early.
-BINARY_EXTS = _PARQUET_EXTS | _EXCEL_EXTS
+BINARY_EXTS = PARQUET_EXTS | _EXCEL_EXTS
+
+# Formats known not to be parquet. An unrecognised extension is not on this
+# list: parquet turns up under .parq, .snappy and no extension at all, so those
+# are worth attempting rather than refusing.
+NON_PARQUET_EXTS = READABLE_EXTS - PARQUET_EXTS
 
 
 class ReadOnlyViolation(ValueError):

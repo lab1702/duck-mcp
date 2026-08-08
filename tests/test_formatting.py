@@ -5,12 +5,43 @@ from __future__ import annotations
 import pytest
 
 from duckdb_mcp.formatting import (
+    escape_invisibles,
     format_bytes,
     format_cell,
+    format_size,
     render_result,
     to_markdown_table,
     truncation_note,
 )
+
+
+@pytest.mark.parametrize(
+    ("count", "expected"),
+    [
+        (0, "0B"),
+        (999, "999B"),
+        (1024, "1.0KB"),
+        (200 * 1024, "200.0KB"),
+        (1024 * 1024, "1.0MB"),
+        (int(1.15 * 1024 * 1024), "1.1MB"),
+        (int(1.95 * 1024 * 1024), "1.9MB"),
+        (3 * 1024**3, "3.0GB"),
+    ],
+)
+def test_format_size_keeps_sizes_distinguishable(count, expected):
+    """1.1MB and 1.9MB must not both render as the same whole-unit figure."""
+    assert format_size(count) == expected
+
+
+def test_escape_invisibles_reveals_control_characters():
+    assert escape_invisibles("a\tb") == "a\\tb"
+    assert escape_invisibles("a\rb") == "a\\rb"
+    assert escape_invisibles("a\x00b") == "a\\x00b"
+    assert escape_invisibles("﻿id") == "<BOM>id"
+
+
+def test_escape_invisibles_leaves_real_text_alone():
+    assert escape_invisibles("café — naïve, 日本語") == "café — naïve, 日本語"
 
 
 def test_format_cell_handles_specials():

@@ -32,7 +32,9 @@ file is ordered by time or partition and its head is not representative. If a
 file's parsed output looks wrong -- odd column names, one column holding
 everything, fewer rows than expected -- `inspect_raw` shows the underlying text
 and what the CSV sniffer made of it; the other tools cannot, because they all
-read through that same parser.
+read through that same parser. For parquet, `parquet_metadata` reads the footer
+rather than the data: row counts, per-column size and compression, and whether
+a filter can skip row groups, all without a scan.
 """
 
 settings = Settings.from_env()
@@ -169,6 +171,23 @@ async def profile_columns(
         top_k: Number of most-frequent values to show; 0 to skip that pass.
     """
     return await _call(tools.profile_columns, get_session(), settings, path, columns, top_k)
+
+
+@mcp.tool()
+async def parquet_metadata(path: str, row_groups: bool = False) -> str:
+    """Report a parquet file's physical layout from its footer, without scanning it.
+
+    Use this to answer questions a scan would be a poor way to answer: how many
+    rows a file holds, which columns dominate its size, how well each
+    compresses, and whether a range filter on a column can skip row groups
+    (the `row_group_order` column). Also flags layouts that make scans
+    expensive -- undersized row groups, or a glob of many small files.
+
+    Args:
+        path: Parquet file path, glob or URL.
+        row_groups: Also list each row group's row count and size.
+    """
+    return await _call(tools.parquet_metadata, get_session(), settings, path, row_groups)
 
 
 def _positive_int(text: str) -> int:

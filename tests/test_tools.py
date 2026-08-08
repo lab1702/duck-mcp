@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 
 import pytest
 
@@ -13,6 +14,7 @@ from duckdb_mcp.tools import (
     describe_file,
     inspect_raw,
     list_files,
+    parquet_metadata,
     preview_file,
     profile_columns,
     run_query,
@@ -479,6 +481,133 @@ def test_profile_columns_reports_truncated_table(session, settings, sales):
     shown = body_rows(out)
     assert shown < 4
     assert f"showing {shown} of 4 columns" in out
+
+
+@pytest.fixture(scope="session")
+def layout_dir(tmp_path_factory):
+    """Parquet written three ways: sorted, shuffled, and split into small files."""
+    import duckdb
+
+    directory = tmp_path_factory.mktemp("layout")
+    con = duckdb.connect(":memory:")
+    body = """SELECT i AS id,
+                     TIMESTAMP '2026-01-01' + INTERVAL (i) SECOND AS ts,
+                     printf('cust-%08d', i) AS label,
+                     i % 7 AS bucket,
+                     NULL::VARCHAR AS always_null
+              FROM range(60000) t(i)"""
+    con.execute(
+        f"COPY ({body}) TO '{(directory / 'sorted.parquet').as_posix()}' (ROW_GROUP_SIZE 10000)"
+    )
+    con.execute(
+        f"COPY ({body} ORDER BY hash(i)) TO "
+        f"'{(directory / 'shuffled.parquet').as_posix()}' (ROW_GROUP_SIZE 10000)"
+    )
+    many = directory / "many"
+    many.mkdir()
+    for part in range(4):
+        con.execute(
+            f"COPY (SELECT i FROM range({part * 500}, {part * 500 + 500}) t(i)) "
+            f"TO '{(many / f'part{part}.parquet').as_posix()}' (ROW_GROUP_SIZE 250)"
+        )
+    con.close()
+    return directory
+
+
+def test_parquet_metadata_reads_the_footer_without_scanning(
+    session, settings, layout_dir, monkeypatch
+):
+    """Row counts must come from metadata, never from a count(*) over the data."""
+    scanned: list[str] = []
+    real_execute = session.execute
+
+    def spy(sql, **kwargs):
+        if "parquet_metadata" not in sql and "parquet_file_metadata" not in sql:
+            scanned.append(sql)
+        return real_execute(sql, **kwargs)
+
+    monkeypatch.setattr(session, "execute", spy)
+    out = parquet_metadata(session, settings, (layout_dir / "sorted.parquet").as_posix())
+    assert scanned == []
+    assert "60,000 rows" in out
+    assert "6 row group(s)" in out
+
+
+def test_parquet_metadata_marks_a_sorted_column_ascending(session, settings, layout_dir):
+    out = parquet_metadata(session, settings, (layout_dir / "sorted.parquet").as_posix())
+    assert "ascending" in row_for(out, "id")
+    assert "ascending" in row_for(out, "ts")  # timestamps compare as ISO text
+    assert "ascending" in row_for(out, "label")  # strings compare bytewise
+    # A column cycling 0..6 spans every row group, so no filter on it can prune.
+    assert "scattered" in row_for(out, "bucket")
+
+
+def test_parquet_metadata_marks_a_shuffled_file_scattered(session, settings, layout_dir):
+    out = parquet_metadata(session, settings, (layout_dir / "shuffled.parquet").as_posix())
+    for column in ("id", "ts", "label"):
+        assert "scattered" in row_for(out, column)
+
+
+def test_parquet_metadata_reports_columns_without_statistics(session, settings, layout_dir):
+    out = parquet_metadata(session, settings, (layout_dir / "sorted.parquet").as_posix())
+    # An all-NULL column has no min/max, so ordering is unknown -- not "ascending".
+    assert "no stats" in row_for(out, "always_null")
+    assert "ascending" not in row_for(out, "always_null")
+
+
+def test_parquet_metadata_shows_per_column_size(session, settings, layout_dir):
+    out = parquet_metadata(session, settings, (layout_dir / "sorted.parquet").as_posix())
+    assert "SNAPPY" in out
+    assert "| label |" in out
+    # Sizes must keep a decimal, or every mid-sized column reads as the same "1MB".
+    assert re.search(r"\d+\.\d+(KB|MB)", out)
+
+
+def test_parquet_metadata_warns_about_small_files_and_row_groups(session, settings, layout_dir):
+    out = parquet_metadata(session, settings, (layout_dir / "many" / "*.parquet").as_posix())
+    assert "4 parquet file(s), 2,000 rows" in out
+    assert "row groups average only" in out
+    assert "4 files averaging" in out
+
+
+def test_parquet_metadata_stays_quiet_on_a_healthy_layout(session, settings, layout_dir):
+    out = parquet_metadata(session, settings, (layout_dir / "sorted.parquet").as_posix())
+    assert "Note:" not in out
+
+
+def test_parquet_metadata_lists_row_groups_on_request(session, settings, layout_dir):
+    path = (layout_dir / "sorted.parquet").as_posix()
+    assert "row_group" not in parquet_metadata(session, settings, path).lower().split("|")[0]
+    out = parquet_metadata(session, settings, path, row_groups=True)
+    assert "| file | row_group | rows | bytes |" in out
+    assert "sorted.parquet" in out
+
+
+def test_parquet_metadata_rejects_a_non_parquet_file(session, settings, data_dir):
+    with pytest.raises(ToolError, match="not parquet"):
+        parquet_metadata(session, settings, (data_dir / "sales.csv").as_posix())
+
+
+def test_parquet_metadata_reports_no_match_cleanly(session, settings, tmp_path):
+    """DuckDB's own error embeds the whole statement; that must not leak."""
+    with pytest.raises(ToolError) as excinfo:
+        parquet_metadata(session, settings, (tmp_path / "absent.parquet").as_posix())
+    assert "No files matched" in str(excinfo.value)
+    assert "SELECT" not in str(excinfo.value)
+
+
+def test_parquet_metadata_truncates_a_wide_schema(session, settings, tmp_path):
+    import duckdb
+
+    wide = tmp_path / "wide.parquet"
+    cols = ", ".join(f"i AS c{n}" for n in range(120))
+    con = duckdb.connect(":memory:")
+    con.execute(f"COPY (SELECT {cols} FROM range(10) t(i)) TO '{wide.as_posix()}'")
+    con.close()
+
+    settings.max_bytes = 700
+    out = parquet_metadata(session, settings, wide.as_posix())
+    assert "of 120 columns" in out
 
 
 def test_join_across_formats(session, settings, data_dir):

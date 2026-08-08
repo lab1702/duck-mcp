@@ -13,6 +13,7 @@ from .config import HARD_MAX_ROWS, Settings
 from .db import (
     BINARY_EXTS,
     CSV_EXTS,
+    NON_PARQUET_EXTS,
     READABLE_EXTS,
     DuckDBSession,
     QueryTimeout,
@@ -27,6 +28,7 @@ from .db import (
 from .formatting import (
     escape_invisibles,
     format_cell,
+    format_size,
     render_result,
     to_markdown_table,
     truncation_note,
@@ -40,6 +42,12 @@ PROFILE_TOP_VALUE_DISTINCT_LIMIT = 50
 # which is one enormous minified JSON line cannot be pulled into memory whole.
 RAW_MAX_LINES = 500
 RAW_LINE_CHARS = 2000
+
+# Thresholds for the layout warnings parquet_metadata emits. Both describe the
+# same failure: work split so finely that per-unit overhead dominates. The
+# figures are conventional rules of thumb, not DuckDB limits.
+SMALL_ROW_GROUP_ROWS = 10_000
+SMALL_FILE_BYTES = 16 * 1024 * 1024
 
 _NESTED_TYPE_PREFIXES = ("STRUCT", "MAP", "UNION", "LIST")
 
@@ -525,6 +533,196 @@ def profile_columns(
     if note:
         parts.append(note)
     return "\n\n".join(parts)
+
+
+# --------------------------------------------------------------------------
+# parquet_metadata
+# --------------------------------------------------------------------------
+
+# Whether a column's row groups are stored in ascending order decides whether a
+# range filter on it can skip row groups. The comparison has to work for every
+# way parquet renders a statistic as text: numerically when both ends parse as
+# numbers ('10' >= '9' is false as text but true as numbers), lexicographically
+# otherwise -- which is correct both for BYTE_ARRAY, whose statistics parquet
+# already orders bytewise, and for the ISO-8601 text DuckDB gives timestamps.
+_ASCENDING = """CASE
+    WHEN try_cast(lo AS DOUBLE) IS NOT NULL AND try_cast(prev_hi AS DOUBLE) IS NOT NULL
+        THEN try_cast(lo AS DOUBLE) >= try_cast(prev_hi AS DOUBLE)
+    ELSE lo >= prev_hi
+END"""
+
+
+def parquet_metadata(
+    session: DuckDBSession,
+    settings: Settings,
+    path: str,
+    row_groups: bool = False,
+) -> str:
+    """Report a parquet file's physical layout, read from its footer.
+
+    Answers what a scan cannot cheaply answer: how the bytes are arranged, how
+    much each column costs, and whether a filter can skip row groups. Nothing
+    is decompressed, so this stays cheap on a file far too large to profile.
+    """
+    ext = extension_of(path)
+    if ext in NON_PARQUET_EXTS:
+        raise ToolError(
+            f"{path} is not parquet ({ext}), and only parquet carries this metadata. "
+            "Use describe_file for its schema, or profile_columns for its contents."
+        )
+
+    literal = sql_string(path)
+    budget = session.budget()
+    try:
+        _, summary = _run(
+            session,
+            "SELECT count(*), sum(num_rows), sum(num_row_groups), sum(file_size_bytes), "
+            "any_value(created_by), count(DISTINCT format_version), max(format_version) "
+            f"FROM parquet_file_metadata({literal})",
+            budget=budget,
+        )
+    except ToolError as exc:
+        # DuckDB answers a glob that matches nothing with an IO error carrying
+        # the whole statement behind it. That is noise around an ordinary
+        # outcome, so it gets said plainly instead.
+        if "No files found" in str(exc):
+            raise ToolError(f"No files matched {path}.") from exc
+        raise
+    if not summary or summary[0][0] in (0, None):
+        raise ToolError(f"No parquet files matched {path}.")
+    files, rows, groups, size, created_by, version_count, version = summary[0]
+    files, rows, groups = int(files), int(rows or 0), int(groups or 0)
+
+    _, columns = _run(
+        session,
+        f"""WITH meta AS (
+                SELECT file_name, path_in_schema AS col, column_id, row_group_id, type,
+                       compression, total_compressed_size AS comp,
+                       total_uncompressed_size AS uncomp, stats_null_count AS nulls,
+                       stats_min_value AS lo, stats_max_value AS hi
+                FROM parquet_metadata({literal})
+            ),
+            stepped AS (
+                SELECT *, lag(hi) OVER (
+                    PARTITION BY file_name, col ORDER BY row_group_id
+                ) AS prev_hi
+                FROM meta
+            )
+            SELECT col, any_value(type),
+                   CASE WHEN count(DISTINCT compression) = 1
+                        THEN any_value(compression) ELSE 'mixed' END,
+                   sum(comp), sum(uncomp), sum(nulls), count(*),
+                   count(*) FILTER (lo IS NULL OR hi IS NULL),
+                   count(*) FILTER (
+                       prev_hi IS NOT NULL AND lo IS NOT NULL AND NOT ({_ASCENDING})
+                   )
+            FROM stepped GROUP BY col ORDER BY min(column_id)""",
+        budget=budget,
+    )
+
+    records: list[list[Any]] = []
+    for col, ctype, codec, comp, uncomp, nulls, chunks, no_stats, unordered in columns:
+        comp, uncomp = int(comp or 0), int(uncomp or 0)
+        records.append([
+            col,
+            ctype,
+            codec,
+            format_size(comp),
+            f"{uncomp / comp:.1f}x" if comp else "—",
+            f"{int(nulls or 0):,}",
+            _row_group_order(int(chunks), int(no_stats), int(unordered)),
+        ])
+
+    header = (
+        f"**{path}** — {files:,} parquet file(s), {rows:,} rows, "
+        f"{groups:,} row group(s), {format_size(int(size or 0))} on disk"
+    )
+    detail = f"Written by {created_by or 'unknown'}"
+    if version is not None:
+        detail += f" (format v{int(version)}{', mixed' if int(version_count or 1) > 1 else ''})"
+    detail += ". Row counts come from the footer, so nothing was scanned."
+
+    table, emitted = to_markdown_table(
+        ["column", "type", "codec", "compressed", "ratio", "nulls", "row_group_order"],
+        records,
+        max_bytes=settings.max_bytes,
+    )
+    parts = [header, detail, table]
+    note = truncation_note(emitted, len(records), settings.max_bytes, unit="columns")
+    if note:
+        parts.append(note)
+    parts.append(
+        "(`row_group_order` is `ascending` when a column's row-group ranges climb in "
+        "file order, so a range filter on it skips row groups; `scattered` when they "
+        "overlap, so every group must be read.)"
+    )
+    parts.extend(_layout_warnings(files, rows, groups, int(size or 0)))
+    if row_groups:
+        parts.append(_row_group_table(session, settings, literal, budget=budget))
+    return "\n\n".join(part for part in parts if part)
+
+
+def _row_group_order(chunks: int, no_stats: int, unordered: int) -> str:
+    """Summarise one column's row-group ordering for the table."""
+    if no_stats:
+        return "no stats"
+    if chunks < 2:
+        return "—"  # a single row group is trivially ordered, and prunes nothing
+    if unordered == 0:
+        return "ascending"
+    return f"scattered ({unordered}/{chunks - 1})"
+
+
+def _layout_warnings(files: int, rows: int, groups: int, size: int) -> list[str]:
+    """Flag layouts that make a scan cost more than the data justifies."""
+    warnings = []
+    if groups > 1 and rows:
+        per_group = rows // groups
+        if per_group < SMALL_ROW_GROUP_ROWS:
+            warnings.append(
+                f"Note: row groups average only {per_group:,} rows. Small row groups add "
+                "per-group overhead and give the reader less to parallelise over; "
+                "128MB-ish groups are the usual target."
+            )
+    if files > 1 and size and size // files < SMALL_FILE_BYTES:
+        warnings.append(
+            f"Note: {files:,} files averaging {format_size(size // files)} each. Many small "
+            "files cost one open per file, which dominates on object storage."
+        )
+    return warnings
+
+
+def _row_group_table(
+    session: DuckDBSession, settings: Settings, literal: str, *, budget: TimeBudget
+) -> str:
+    """Per-row-group rows and bytes, for spotting uneven splits."""
+    limit = _clamp_rows(None, settings.max_rows)
+    _, rows = _run(
+        session,
+        "SELECT file_name, row_group_id, row_group_num_rows, row_group_bytes FROM ("
+        "  SELECT DISTINCT file_name, row_group_id, row_group_num_rows, row_group_bytes"
+        f"  FROM parquet_metadata({literal})"
+        ") ORDER BY file_name, row_group_id",
+        budget=budget,
+        max_rows=limit + 1,
+    )
+    table_rows = [
+        (
+            os.path.basename(str(name).replace("\\", "/")),
+            group,
+            f"{int(count):,}",
+            format_size(int(nbytes)),
+        )
+        for name, group, count, nbytes in rows[:limit]
+    ]
+    return render_result(
+        ["file", "row_group", "rows", "bytes"],
+        table_rows,
+        max_rows=limit,
+        max_bytes=settings.max_bytes,
+        total_rows=len(rows),
+        header="Row groups:",
+    )
 
 
 def _top_values(

@@ -65,6 +65,19 @@ def format_bytes(count: int) -> str:
     return f"{count}B"
 
 
+def format_size(count: int) -> str:
+    """Render a measured size, keeping enough precision to compare two of them.
+
+    ``format_bytes`` rounds to whole units, which is right for a stated cap but
+    collapses 1.1MB and 1.9MB onto the same "1MB" -- useless in a table whose
+    point is which column dominates the file.
+    """
+    for unit, scale in (("GB", 1024**3), ("MB", 1024**2), ("KB", 1024)):
+        if count >= scale:
+            return f"{count / scale:.1f}{unit}"
+    return f"{count}B"
+
+
 def truncation_note(emitted: int, total: int, max_bytes: int, unit: str = "rows") -> str | None:
     """Describe a byte-capped table, or ``None`` when nothing was dropped."""
     if emitted >= total:
