@@ -1,0 +1,31 @@
+# Line endings are a property of this repository, not of whoever clones it.
+# Without this file the outcome depends on each contributor's core.autocrlf,
+# which defaults to false off Windows -- enough for one CRLF commit to churn a
+# whole file's diff.
+
+# Store every text file as LF, detecting text automatically.
+* text=auto
+
+# Check the sources out as LF too. An editor that preserves a file's existing
+# endings then has no CRLF to preserve, so the drift cannot start.
+*.py    text eol=lf
+*.md    text eol=lf
+*.toml  text eol=lf
+*.cfg   text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.json  text eol=lf
+LICENSE text eol=lf
+
+# Data files are read byte for byte, and some tests turn on their exact line
+# endings, so nothing here may rewrite them.
+*.csv   -text
+*.tsv   -text
+*.json5 -text
+*.ndjson -text
+*.jsonl -text
+*.parquet binary
+*.pq    binary
+*.xlsx  binary
+*.xls   binary
+*.xlsm  binary
