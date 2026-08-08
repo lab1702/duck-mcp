@@ -1,0 +1,167 @@
+"""MCP server wiring: exposes the DuckDB tools over stdio."""
+
+from __future__ import annotations
+
+import argparse
+import functools
+from typing import Any, Callable, Sequence
+
+import anyio.to_thread
+from mcp.server.mcpserver import MCPServer
+
+from . import __version__, tools
+from .config import Settings
+from .db import DuckDBSession, log
+
+INSTRUCTIONS = """\
+Query local and remote data files with DuckDB SQL. Nothing is ever written:
+only SELECT and EXPLAIN statements run, one per call.
+
+Paths are passed straight to DuckDB, so anything it can read works: local
+paths, globs (`data/*.parquet`, `data/**/*.csv`), `https://` URLs and `s3://`
+URIs (AWS credentials are picked up from the usual environment). CSV, Parquet,
+JSON/NDJSON and Excel workbooks are all recognised by extension.
+
+A typical flow: `list_files` to see what is there, `describe_file` for the
+schema, `preview_file` for real values, `profile_columns` when you need null
+rates and cardinality, then `query` to answer the question. In `query`, refer
+to files by quoting the path: `SELECT * FROM 'data/sales.parquet'`.
+"""
+
+settings = Settings.from_env()
+_session: DuckDBSession | None = None
+
+mcp = MCPServer("duckdb", instructions=INSTRUCTIONS, version=__version__)
+
+
+def get_session() -> DuckDBSession:
+    """Create the shared in-memory DuckDB instance on first use."""
+    global _session
+    if _session is None:
+        _session = DuckDBSession(default_timeout=settings.timeout_seconds)
+        log(f"duckdb-mcp {__version__} ready; extensions: {_session.capabilities}")
+    return _session
+
+
+async def _call(fn: Callable[..., str], *args: Any, **kwargs: Any) -> str:
+    """Run a blocking tool implementation off the event loop."""
+    return await anyio.to_thread.run_sync(functools.partial(fn, *args, **kwargs))
+
+
+@mcp.tool()
+async def query(sql: str, max_rows: int | None = None) -> str:
+    """Run a read-only DuckDB SQL statement and return the rows as a markdown table.
+
+    Only a single SELECT (including WITH/DESCRIBE/SUMMARIZE/SHOW) or EXPLAIN
+    statement is accepted; anything that writes data, files or settings is
+    rejected. Read files by quoting their path in the FROM clause, e.g.
+    `SELECT region, sum(amount) FROM 'data/sales.parquet' GROUP BY 1`.
+
+    Args:
+        sql: The statement to run.
+        max_rows: Row cap for this call (defaults to the server's limit).
+    """
+    return await _call(tools.run_query, get_session(), settings, sql, max_rows)
+
+
+@mcp.tool()
+async def describe_file(path: str, include_row_count: bool = True) -> str:
+    """Return the column names and types of a data file, plus its row count.
+
+    Works for any path DuckDB can read -- csv, parquet, json/ndjson, xlsx,
+    compressed variants, globs matching many files, http(s) URLs and s3 URIs.
+
+    Args:
+        path: File path, glob or URL, e.g. 'data/sales_*.parquet'.
+        include_row_count: Set False to skip counting rows on very large inputs.
+    """
+    return await _call(tools.describe_file, get_session(), settings, path, include_row_count)
+
+
+@mcp.tool()
+async def preview_file(path: str, rows: int = 20) -> str:
+    """Show the first rows of a data file so you can see real values.
+
+    Args:
+        path: File path, glob or URL.
+        rows: How many rows to show (default 20).
+    """
+    return await _call(tools.preview_file, get_session(), settings, path, rows)
+
+
+@mcp.tool()
+async def list_files(
+    path: str = ".",
+    pattern: str = "*",
+    recursive: bool = False,
+    data_files_only: bool = True,
+) -> str:
+    """List data files in a directory (local, or an s3:// prefix).
+
+    Args:
+        path: Directory or bucket prefix to list.
+        pattern: Glob pattern for the file name, e.g. '*.parquet'.
+        recursive: Descend into subdirectories.
+        data_files_only: Keep only extensions DuckDB can read; set False to see everything.
+    """
+    return await _call(
+        tools.list_files, get_session(), settings, path, pattern, recursive, data_files_only
+    )
+
+
+@mcp.tool()
+async def profile_columns(
+    path: str,
+    columns: list[str] | None = None,
+    top_k: int = 5,
+) -> str:
+    """Profile a file's columns: null counts, approximate distinct counts, min/max
+    and the most frequent values of low-cardinality columns.
+
+    This scans the whole file, so prefer describe_file when you only need types.
+
+    Args:
+        path: File path, glob or URL.
+        columns: Restrict to these columns (default: all).
+        top_k: Number of most-frequent values to show; 0 to skip that pass.
+    """
+    return await _call(tools.profile_columns, get_session(), settings, path, columns, top_k)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="duckdb-mcp",
+        description="Read-only DuckDB MCP server for CSV, Parquet, JSON and Excel files.",
+    )
+    parser.add_argument("--version", action="version", version=f"duckdb-mcp {__version__}")
+    parser.add_argument(
+        "--max-rows", type=int, default=None, help="Default row cap per query (env DUCKDB_MCP_MAX_ROWS)."
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=None,
+        help="Seconds before a query is cancelled (env DUCKDB_MCP_TIMEOUT).",
+    )
+    parser.add_argument(
+        "--max-bytes",
+        type=int,
+        default=None,
+        help="Approximate cap on result text size (env DUCKDB_MCP_MAX_BYTES).",
+    )
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    args = build_parser().parse_args(argv)
+    if args.max_rows is not None:
+        settings.max_rows = args.max_rows
+    if args.timeout is not None:
+        settings.timeout_seconds = args.timeout
+    if args.max_bytes is not None:
+        settings.max_bytes = args.max_bytes
+    mcp.run(transport="stdio")
+
+
+if __name__ == "__main__":  # pragma: no cover
+    main()

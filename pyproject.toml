@@ -1,0 +1,39 @@
+[project]
+name = "duck-mcp"
+version = "0.1.0"
+description = "MCP server exposing read-only DuckDB schema discovery and SQL query tools over CSV, Parquet, JSON, Excel and more."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "lab1702" }]
+keywords = ["mcp", "duckdb", "sql", "parquet", "csv"]
+classifiers = [
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Database",
+]
+dependencies = [
+    "duckdb>=1.1.0",
+    "mcp>=2.0.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+duckdb-mcp = "duckdb_mcp.server:main"
+
+[project.urls]
+Homepage = "https://github.com/lab1702/duck-mcp"
+Issues = "https://github.com/lab1702/duck-mcp/issues"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/duckdb_mcp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
