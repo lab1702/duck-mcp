@@ -71,6 +71,8 @@ No clone, no virtualenv, no `pip install`. To pick up a new release, run
 | `query(sql, max_rows=500)` | Run a read-only SQL statement, returns a markdown table. |
 | `describe_file(path, include_row_count=True)` | Column names, types and row count for a file or glob. |
 | `preview_file(path, rows=20)` | First N rows, so the model sees real values. |
+| `sample_rows(path, rows=20, seed=None)` | A *random* sample of rows, for files whose head is not representative. |
+| `inspect_raw(path, lines=20)` | Raw lines of a text file, before parsing, plus what the CSV sniffer detected. |
 | `list_files(path, pattern="*", recursive=False)` | List readable data files in a directory or `s3://` prefix. |
 | `profile_columns(path, columns=None, top_k=5)` | Null counts, approximate distinct counts, min/max and most-frequent values. |
 
@@ -92,6 +94,64 @@ FROM 'data/sales.parquet' s
 JOIN 'data/customers.csv' c ON c.id = s.customer_id
 GROUP BY 1
 ```
+
+### Sampling instead of the head
+
+`preview_file` returns the first rows. For a file written in time or partition
+order that is systematically unrepresentative — one date, one region, and often
+the oldest and most schema-drifted records in the set. `sample_rows` draws a
+uniform random sample instead:
+
+```
+sample_rows('data/events_2026.parquet', rows=20, seed=42)
+```
+
+That costs a full scan, which the head does not, so it is the right tool for
+understanding a file rather than for glancing at one. Passing `seed` fixes the
+draw, so a follow-up call revisits the same rows.
+
+### When the parse looks wrong
+
+Every other tool reads through DuckDB's CSV/JSON parser, so if auto-detection
+misreads a file there is nothing to check its answer against — the result is
+plausible-looking but wrong data, with no error. DuckDB's sniffer is good, but
+a report footer is enough to defeat it:
+
+```
+id,name,amount
+1,alice,5
+2,bob,6
+-- end of report --
+```
+
+`describe_file` reports **one** `VARCHAR` column named `id,name,amount`, three
+rows, no error. `inspect_raw` shows the lines next to what the sniffer concluded:
+
+```text
+1 | id,name,amount
+2 | 1,alice,5
+3 | 2,bob,6
+4 | -- end of report --
+```
+
+> DuckDB's CSV sniffer reads this as: delimiter `','`, skip 0 row(s), header
+> row yes, **3 column(s)**.
+
+Three columns against the one `describe_file` produced — the disagreement is
+the diagnosis. `inspect_raw` also prints the sniffer's own `read_csv` call,
+which here is already the fix, and can be pasted straight into `query`:
+
+```sql
+FROM read_csv('report.csv', auto_detect=false, delim=',', header=true,
+              columns={'id': 'BIGINT', 'name': 'VARCHAR', 'amount': 'BIGINT'},
+              ignore_errors=true);   -- returns the 2 real rows
+```
+
+`inspect_raw` reads only as many lines as you ask for, so it is safe on a
+multi-gigabyte file, and it tolerates input a real parse rejects — mixed line
+endings, unterminated quotes, ragged rows. Tabs, carriage returns and other
+invisible characters are escaped so they can be seen. It is text-only; parquet
+and Excel are rejected with a pointer to `describe_file`.
 
 ## Remote files
 

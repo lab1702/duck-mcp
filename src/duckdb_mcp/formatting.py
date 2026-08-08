@@ -30,6 +30,32 @@ def format_cell(value: Any) -> str:
     return text.replace("|", "\\|")
 
 
+def escape_invisibles(text: str) -> str:
+    """Make characters that a raw peek exists to reveal actually visible.
+
+    A tab where a comma was expected, a stray carriage return or an embedded
+    NUL all break a parse without leaving a mark on screen. Printable
+    characters -- including non-ASCII text -- are left alone. A byte-order mark
+    is rendered too: DuckDB strips a leading one itself, but concatenated
+    exports can carry one into the middle of a file, where nothing strips it.
+    """
+    out = []
+    for char in text:
+        if char == "﻿":
+            out.append("<BOM>")
+        elif char == "\t":
+            out.append("\\t")
+        elif char == "\r":
+            out.append("\\r")
+        elif char == "\n":
+            out.append("\\n")
+        elif ord(char) < 0x20 or ord(char) == 0x7F:
+            out.append(f"\\x{ord(char):02x}")
+        else:
+            out.append(char)
+    return "".join(out)
+
+
 def format_bytes(count: int) -> str:
     """Render a byte cap for a truncation note, without flooring to ``0KB``."""
     if count >= 1024 * 1024:

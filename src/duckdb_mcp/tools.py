@@ -11,21 +11,35 @@ import duckdb
 
 from .config import HARD_MAX_ROWS, Settings
 from .db import (
+    BINARY_EXTS,
+    CSV_EXTS,
     READABLE_EXTS,
     DuckDBSession,
     QueryTimeout,
     TimeBudget,
     assert_read_only,
+    extension_of,
     format_duckdb_error,
     quote_ident,
     source_expr,
     sql_string,
 )
-from .formatting import format_cell, render_result, to_markdown_table, truncation_note
+from .formatting import (
+    escape_invisibles,
+    format_cell,
+    render_result,
+    to_markdown_table,
+    truncation_note,
+)
 
 PROFILE_MAX_COLUMNS = 60
 PROFILE_TOP_VALUE_COLUMNS = 20
 PROFILE_TOP_VALUE_DISTINCT_LIMIT = 50
+
+# Raw-peek limits. A line is cut in SQL rather than in Python so that a file
+# which is one enormous minified JSON line cannot be pulled into memory whole.
+RAW_MAX_LINES = 500
+RAW_LINE_CHARS = 2000
 
 _NESTED_TYPE_PREFIXES = ("STRUCT", "MAP", "UNION", "LIST")
 
@@ -183,6 +197,174 @@ def preview_file(
         header=f"**{path}** — first {{rows}} rows",
         empty_note="(file is empty)",
     )
+
+
+# --------------------------------------------------------------------------
+# sample_rows
+# --------------------------------------------------------------------------
+
+
+def sample_rows(
+    session: DuckDBSession,
+    settings: Settings,
+    path: str,
+    rows: int | None = None,
+    seed: int | None = None,
+) -> str:
+    """Return a random sample of rows rather than the first ones.
+
+    ``preview_file`` shows the head of a file, which for anything written in
+    time or partition order is systematically unrepresentative -- one date, one
+    region, and often the oldest and most schema-drifted records in the set.
+    """
+    limit = _clamp_rows(rows, 20)
+    source = source_expr(path)
+    # Reservoir sampling gives exactly ``limit`` rows with uniform probability,
+    # at the cost of a full scan -- there is no way to draw a fair sample from
+    # an unknown row count without one. REPEATABLE makes the draw reproducible,
+    # so a follow-up call can revisit the same rows.
+    clause = f"USING SAMPLE reservoir({limit} ROWS)"
+    if seed is not None:
+        clause += f" REPEATABLE ({int(seed)})"
+    columns, fetched = _run(
+        session, f"SELECT * FROM {source} {clause}", budget=session.budget(), max_rows=limit
+    )
+
+    header = f"**{path}** — random sample of {{rows}} rows"
+    if len(fetched) < limit:
+        # Fewer rows came back than were asked for, so the sample is the file.
+        header = f"**{path}** — all {{rows}} rows (fewer than the {limit} sampled)"
+    return render_result(
+        columns,
+        fetched,
+        max_rows=limit,
+        max_bytes=settings.max_bytes,
+        # The sample is already the whole result, so the only way rows go
+        # missing here is the byte cap; total_rows says so without implying
+        # that more of the sample was available.
+        total_rows=len(fetched),
+        header=header,
+        empty_note="(file is empty)",
+    )
+
+
+# --------------------------------------------------------------------------
+# inspect_raw
+# --------------------------------------------------------------------------
+
+
+def inspect_raw(
+    session: DuckDBSession,
+    settings: Settings,
+    path: str,
+    lines: int | None = None,
+) -> str:
+    """Show a file's raw lines, plus what DuckDB's CSV sniffer makes of them.
+
+    Every other tool here goes through the CSV parser, so when auto-detection
+    guesses wrong there is nothing to compare its answer against: a file with a
+    comment preamble or an unexpected delimiter comes back as plausible-looking
+    but wrong data, with no error. This is the one view that does not depend on
+    the parser being right.
+    """
+    ext = extension_of(path)
+    if ext in BINARY_EXTS:
+        raise ToolError(
+            f"{path} is a binary container, not text; reading it as lines would show nothing "
+            "useful. Use describe_file or preview_file instead."
+        )
+
+    limit = max(1, min(int(20 if lines is None else lines), RAW_MAX_LINES))
+    budget = session.budget()
+    literal = sql_string(path)
+    # One VARCHAR column, quoting and escaping disabled, and a delimiter no
+    # text file contains: every physical line arrives intact, including the
+    # ones a real parse would reject. LIMIT pushes down, so a 10GB file costs
+    # only the first few kilobytes of it.
+    #
+    # strict_mode=false matters more than it looks: in strict mode a file with
+    # mixed \n and \r\n endings fails outright, and a file this tool is worth
+    # running on is exactly the file likely to have them. A raw peek that
+    # errors on malformed input would be useless at the one job it has.
+    reader = (
+        f"read_csv({literal}, columns={{'line': 'VARCHAR'}}, header=false, "
+        "auto_detect=false, delim=e'\\x07', quote='', escape='', "
+        "strict_mode=false, ignore_errors=true)"
+    )
+    _, fetched = _run(
+        session,
+        f"SELECT substr(line, 1, {RAW_LINE_CHARS}) FROM {reader}",
+        budget=budget,
+        max_rows=limit,
+        limit=limit,
+    )
+    if not fetched:
+        return f"**{path}** — file is empty (0 lines)"
+
+    numbered: list[str] = []
+    width = len(str(len(fetched)))
+    used = 0
+    for index, row in enumerate(fetched, start=1):
+        text = escape_invisibles("" if row[0] is None else str(row[0]))
+        line = f"{index:>{width}} | {text}"
+        if used + len(line) + 1 > settings.max_bytes and numbered:
+            break
+        numbered.append(line)
+        used += len(line) + 1
+
+    parts = [
+        f"**{path}** — first {len(numbered)} line(s), raw",
+        "```text\n" + "\n".join(numbered) + "\n```",
+    ]
+    if len(numbered) < len(fetched):
+        parts.append(truncation_note(len(numbered), len(fetched), settings.max_bytes, unit="lines"))
+
+    sniffed = _sniff_csv(session, path, ext, budget=budget)
+    if sniffed:
+        parts.extend(sniffed)
+    return "\n\n".join(part for part in parts if part)
+
+
+def _sniff_csv(
+    session: DuckDBSession, path: str, ext: str, *, budget: TimeBudget
+) -> list[str]:
+    """What DuckDB's CSV sniffer concluded about ``path``, if it is CSV-ish.
+
+    Reported next to the raw lines so the two can be compared: the sniffer is
+    usually right, and when it is not -- a byte-order mark alone is enough to
+    fold the header into the first column name -- the disagreement is the whole
+    diagnosis. ``Prompt`` is the sniffer's own ``read_csv`` call, which can be
+    edited and passed to ``query`` once the raw lines show what it got wrong.
+    """
+    if ext and ext not in CSV_EXTS:
+        return []
+    try:
+        _, rows = session.execute(
+            "SELECT Delimiter, Quote, Escape, Comment, SkipRows, HasHeader, "
+            f"len(Columns), Prompt FROM sniff_csv({sql_string(path)}, ignore_errors=true)",
+            read_only=False,
+            timeout=budget.remaining(),
+        )
+    except duckdb.Error:
+        # Not a CSV after all (ndjson under a .txt name, say). The raw lines
+        # above are still the answer, so this is not worth an error.
+        return []
+    if not rows:
+        return []
+    delim, quote, escape, comment, skip, header, ncols, prompt = rows[0]
+    summary = (
+        f"DuckDB's CSV sniffer reads this as: delimiter {delim!r}, quote {quote!r}, "
+        f"escape {escape!r}, comment {comment!r}, skip {skip} row(s), "
+        f"header row {'yes' if header else 'no'}, {ncols} column(s)."
+    )
+    parts = [summary]
+    if prompt:
+        parts.append("```sql\n" + str(prompt).strip() + "\n```")
+    parts.append(
+        "(If that disagrees with the raw lines above, pass corrected read_csv options "
+        "to `query` -- e.g. `delim`, `skip`, `comment`, `header`, `columns`.)"
+    )
+    return parts
 
 
 # --------------------------------------------------------------------------

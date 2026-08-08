@@ -26,6 +26,13 @@ A typical flow: `list_files` to see what is there, `describe_file` for the
 schema, `preview_file` for real values, `profile_columns` when you need null
 rates and cardinality, then `query` to answer the question. In `query`, refer
 to files by quoting the path: `SELECT * FROM 'data/sales.parquet'`.
+
+`preview_file` shows the first rows, so reach for `sample_rows` instead when a
+file is ordered by time or partition and its head is not representative. If a
+file's parsed output looks wrong -- odd column names, one column holding
+everything, fewer rows than expected -- `inspect_raw` shows the underlying text
+and what the CSV sniffer made of it; the other tools cannot, because they all
+read through that same parser.
 """
 
 settings = Settings.from_env()
@@ -89,6 +96,40 @@ async def preview_file(path: str, rows: int = 20) -> str:
         rows: How many rows to show (default 20).
     """
     return await _call(tools.preview_file, get_session(), settings, path, rows)
+
+
+@mcp.tool()
+async def sample_rows(path: str, rows: int = 20, seed: int | None = None) -> str:
+    """Show a random sample of rows from a data file.
+
+    Prefer this to preview_file whenever the file is written in time or
+    partition order, where the first rows are all one date or one category and
+    generalising from them is misleading. This scans the whole file.
+
+    Args:
+        path: File path, glob or URL.
+        rows: How many rows to sample (default 20).
+        seed: Fix the draw so repeated calls return the same rows.
+    """
+    return await _call(tools.sample_rows, get_session(), settings, path, rows, seed)
+
+
+@mcp.tool()
+async def inspect_raw(path: str, lines: int = 20) -> str:
+    """Show a text file's raw lines, before any CSV/JSON parsing, together with
+    what DuckDB's CSV sniffer detected.
+
+    Use this when a file's parsed output looks wrong -- unexpected column
+    names, a missing header, far fewer rows than expected, everything in one
+    column. Those come from the parser mis-reading the file rather than from
+    the data, and no other tool can show it: they all go through that parser.
+    Not for parquet or Excel, which are binary.
+
+    Args:
+        path: File path or URL of a text file (csv, tsv, json, ndjson, txt).
+        lines: How many lines to show (default 20).
+    """
+    return await _call(tools.inspect_raw, get_session(), settings, path, lines)
 
 
 @mcp.tool()

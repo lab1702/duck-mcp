@@ -36,12 +36,16 @@ _MIN_TIME_SLICE = 0.001
 
 _COMPRESSION_SUFFIXES = (".gz", ".zst", ".bz2", ".br")
 
-_CSV_EXTS = {".csv", ".tsv", ".tab", ".txt"}
+CSV_EXTS = {".csv", ".tsv", ".tab", ".txt"}
 _JSON_EXTS = {".json", ".ndjson", ".jsonl"}
 _PARQUET_EXTS = {".parquet", ".pq"}
 _EXCEL_EXTS = {".xlsx", ".xlsm", ".xls"}
 
-READABLE_EXTS = _CSV_EXTS | _JSON_EXTS | _PARQUET_EXTS | _EXCEL_EXTS
+READABLE_EXTS = CSV_EXTS | _JSON_EXTS | _PARQUET_EXTS | _EXCEL_EXTS
+
+# Container formats: readable, but not as lines of text. A raw peek at one
+# gets a CSV-parser error rather than anything useful, so callers refuse early.
+BINARY_EXTS = _PARQUET_EXTS | _EXCEL_EXTS
 
 
 class ReadOnlyViolation(ValueError):
@@ -62,7 +66,7 @@ def quote_ident(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
 
 
-def _extension(path: str) -> str:
+def extension_of(path: str) -> str:
     cleaned = path.split("?", 1)[0].rstrip("/")
     lowered = cleaned.lower()
     for suffix in _COMPRESSION_SUFFIXES:
@@ -87,7 +91,7 @@ def source_expr(path: str) -> str:
     if not path:
         raise ValueError("path must not be empty")
     literal = sql_string(path)
-    ext = _extension(path)
+    ext = extension_of(path)
     if ext in _EXCEL_EXTS:
         return f"read_xlsx({literal})"
     if ext in {".tsv", ".tab", ".txt"}:

@@ -1,4 +1,4 @@
-"""The five tools, exercised against real csv / parquet / ndjson files."""
+"""The tools, exercised against real csv / parquet / ndjson files."""
 
 from __future__ import annotations
 
@@ -11,10 +11,12 @@ from duckdb_mcp.db import ReadOnlyViolation
 from duckdb_mcp.tools import (
     ToolError,
     describe_file,
+    inspect_raw,
     list_files,
     preview_file,
     profile_columns,
     run_query,
+    sample_rows,
 )
 
 
@@ -203,6 +205,172 @@ def test_preview_header_matches_the_table_after_byte_truncation(session, setting
     shown = body_rows(out)
     assert f"first {shown} rows" in out
     assert "truncated" in out
+
+
+@pytest.fixture
+def ordered(tmp_path):
+    """2,000 rows in ascending order -- a file whose head is unrepresentative."""
+    path = tmp_path / "ordered.csv"
+    path.write_text(
+        "id\n" + "\n".join(str(i) for i in range(2000)) + "\n", encoding="utf-8"
+    )
+    return path.as_posix()
+
+
+@pytest.fixture
+def malformed(tmp_path):
+    """A BOM, a comment preamble, semicolons and a ragged row.
+
+    Exactly the file the CSV sniffer gets wrong without saying so.
+    """
+    path = tmp_path / "bad.csv"
+    path.write_bytes(
+        "﻿# export from system X\n# generated 2026-01-01\n"
+        "id;name;amount\n1;alice;5\n2;bob;6;extra\n".encode()
+    )
+    return path.as_posix()
+
+
+def test_sample_rows_returns_the_requested_count(session, settings, ordered):
+    out = sample_rows(session, settings, ordered, rows=10, seed=1)
+    assert body_rows(out) == 10
+    assert "random sample of 10 rows" in out
+
+
+def test_sample_rows_is_not_the_head(session, settings, ordered):
+    """The whole point: a sample reaches past the first rows of an ordered file."""
+    out = sample_rows(session, settings, ordered, rows=10, seed=1)
+    values = [
+        int(cell)
+        for line in out.splitlines()
+        if line.startswith("| ")
+        for cell in [line.strip("|").strip()]
+        if cell.isdigit()
+    ]
+    assert len(values) == 10
+    assert max(values) > 100  # the head would be 0..9
+    assert values != list(range(10))
+
+
+def test_sample_rows_is_reproducible_with_a_seed(session, settings, ordered):
+    first = sample_rows(session, settings, ordered, rows=10, seed=7)
+    assert first == sample_rows(session, settings, ordered, rows=10, seed=7)
+
+
+def test_sample_rows_covers_a_short_file_entirely(session, settings, sales):
+    out = sample_rows(session, settings, sales, rows=50, seed=1)
+    assert body_rows(out) == 5
+    assert "all 5 rows" in out
+    assert "more available" not in out
+
+
+def test_sample_rows_on_an_empty_file(session, settings, tmp_path):
+    empty = tmp_path / "empty.csv"
+    empty.write_text("a\n", encoding="utf-8")
+    assert "file is empty" in sample_rows(session, settings, empty.as_posix())
+
+
+def test_sample_rows_reports_byte_truncation_without_claiming_more(session, settings, ordered):
+    settings.max_bytes = 120
+    out = sample_rows(session, settings, ordered, rows=20, seed=1)
+    shown = body_rows(out)
+    assert shown < 20
+    assert f"showing {shown} of 20 rows" in out
+    assert "more available" not in out  # a sample has no "next page"
+
+
+def test_inspect_raw_reveals_what_the_parser_hides(session, settings, malformed):
+    """The motivating case: preview_file is silently wrong, inspect_raw is not."""
+    parsed = preview_file(session, settings, malformed, rows=10)
+    assert "# export from system X" not in parsed
+
+    out = inspect_raw(session, settings, malformed)
+    assert "# export from system X" in out
+    assert "# generated 2026-01-01" in out
+    assert "id;name;amount" in out
+    assert "2;bob;6;extra" in out  # the ragged row, intact
+
+
+def test_inspect_raw_contradicts_a_collapsed_parse(session, settings, tmp_path):
+    """A report footer collapses the file to one column; the sniffer says three."""
+    path = tmp_path / "report.csv"
+    path.write_text(
+        "id,name,amount\n1,alice,5\n2,bob,6\n-- end of report --\n", encoding="utf-8"
+    )
+    assert "1 columns" in describe_file(session, settings, path.as_posix())
+
+    out = inspect_raw(session, settings, path.as_posix())
+    assert "-- end of report --" in out
+    assert "3 column(s)" in out  # the disagreement that is the whole diagnosis
+    assert "ignore_errors=true" in out  # and the sniffer's call, which is the fix
+
+
+def test_inspect_raw_makes_control_characters_visible(session, settings, tmp_path):
+    path = tmp_path / "invisible.csv"
+    path.write_bytes(b"a,b\n1\tx,\x00oops\n")
+    out = inspect_raw(session, settings, path.as_posix())
+    assert "1\\tx,\\x00oops" in out
+
+
+def test_inspect_raw_survives_mixed_line_endings(session, settings, tmp_path):
+    """Strict mode rejects these outright -- and they are why this tool exists."""
+    path = tmp_path / "mixed.csv"
+    path.write_bytes(b"id,name\r\n1,alice\n2,bob\r\n")
+    out = inspect_raw(session, settings, path.as_posix())
+    assert "id,name" in out and "2,bob" in out
+
+
+def test_inspect_raw_numbers_lines_and_caps_them(session, settings, malformed):
+    out = inspect_raw(session, settings, malformed, lines=2)
+    assert "```text" in out
+    assert "1 | # export from system X" in out
+    assert "2 | # generated 2026-01-01" in out
+    assert "id;name;amount" not in out
+
+
+def test_inspect_raw_reports_the_sniffers_verdict(session, settings, malformed):
+    out = inspect_raw(session, settings, malformed)
+    assert "CSV sniffer reads this as" in out
+    assert "```sql" in out
+    assert "read_csv(" in out
+
+
+def test_inspect_raw_pushes_the_line_cap_into_duckdb(session, settings, ordered, monkeypatch):
+    """A raw peek at a huge file must not read the whole file."""
+    real_execute = session.execute
+    calls: list[tuple[int | None, int | None]] = []
+
+    def spy(sql, **kwargs):
+        if "read_csv" in sql and "sniff" not in sql:
+            calls.append((kwargs.get("max_rows"), kwargs.get("limit")))
+        return real_execute(sql, **kwargs)
+
+    monkeypatch.setattr(session, "execute", spy)
+    inspect_raw(session, settings, ordered, lines=5)
+    assert calls == [(5, 5)]
+
+
+def test_inspect_raw_rejects_binary_formats(session, settings, data_dir):
+    with pytest.raises(ToolError, match="binary container"):
+        inspect_raw(session, settings, (data_dir / "sales.parquet").as_posix())
+
+
+def test_inspect_raw_handles_ndjson_without_sniffing_it(session, settings, data_dir):
+    out = inspect_raw(session, settings, (data_dir / "events.ndjson").as_posix())
+    assert '{"id": 1, "region": "West"}' in out
+    assert "CSV sniffer" not in out
+
+
+def test_inspect_raw_on_an_empty_file(session, settings, tmp_path):
+    empty = tmp_path / "nothing.csv"
+    empty.write_text("", encoding="utf-8")
+    assert "0 lines" in inspect_raw(session, settings, empty.as_posix())
+
+
+def test_inspect_raw_respects_the_byte_cap(session, settings, ordered):
+    settings.max_bytes = 60
+    out = inspect_raw(session, settings, ordered, lines=100)
+    assert "of 100 lines" in out
 
 
 def test_list_files_filters_to_data_files(session, settings, data_dir):
