@@ -8,7 +8,8 @@ It is **strictly read-only**: only a single `SELECT` (including
 `WITH`/`DESCRIBE`/`SUMMARIZE`/`SHOW`) or `EXPLAIN` statement runs per call.
 `INSERT`, `CREATE`, `COPY … TO`, `ATTACH`, `SET` and friends are rejected
 before they reach DuckDB, so no tool call can modify data, write files or
-change server state.
+change server state. `EXPLAIN ANALYZE` is rejected too, because it runs the
+statement it wraps.
 
 ## Install
 
@@ -112,7 +113,10 @@ Defaults, all overridable:
 | Result text size | 200 KB | `DUCKDB_MCP_MAX_BYTES` | `--max-bytes` |
 
 Truncated results say so explicitly, e.g. `(showing first 500 rows (more
-available))`. A query that overruns the timeout is cancelled and reported.
+available))`, including when a schema or profile table is cut short by the
+size cap. The timeout covers a whole tool call, not each statement in it, so
+a tool that runs several queries still finishes within it; a call that
+overruns is cancelled and reported.
 
 ```json
 {

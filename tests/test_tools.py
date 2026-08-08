@@ -52,10 +52,41 @@ def test_query_without_cap_note_when_all_rows_fit(session, settings):
 
 
 def test_query_supports_explain(session, settings):
-    # EXPLAIN cannot be wrapped in a subquery; the fallback path handles it.
+    # EXPLAIN cannot be wrapped in a subquery; it runs unwrapped instead.
     out = run_query(session, settings, "EXPLAIN SELECT 1")
     assert "explain_value" in out
     assert body_rows(out) >= 1
+
+
+def test_query_rejects_explain_analyze_write(session, settings, tmp_path):
+    target = tmp_path / "pwned.csv"
+    with pytest.raises(ReadOnlyViolation):
+        run_query(
+            session,
+            settings,
+            f"EXPLAIN ANALYZE COPY (SELECT 1 AS x) TO '{target.as_posix()}'",
+        )
+    assert not target.exists()
+
+
+def test_query_caps_rows_it_cannot_push_a_limit_into(session, settings, monkeypatch):
+    """The row cap must survive the unwrappable-statement path."""
+    import duckdb
+
+    real_execute = session.execute
+    calls: list[int | None] = []
+
+    def spy(sql, **kwargs):
+        calls.append(kwargs.get("max_rows"))
+        if "_duckdb_mcp_q" in sql:
+            raise duckdb.ParserException("simulated: not valid as a subquery")
+        return real_execute(sql, **kwargs)
+
+    monkeypatch.setattr(session, "execute", spy)
+    out = run_query(session, settings, "SELECT * FROM range(100)", max_rows=5)
+    assert body_rows(out) == 5
+    assert "more available" in out
+    assert calls == [6, 6]  # both attempts kept the limit+1 cap
 
 
 def test_query_surfaces_sql_errors(session, settings):
@@ -85,6 +116,19 @@ def test_describe_ndjson(session, settings, data_dir):
     assert "2 columns" in out
 
 
+def test_describe_file_reports_truncated_schema(session, settings, tmp_path):
+    wide = tmp_path / "wide.csv"
+    names = [f"c{i}" for i in range(200)]
+    wide.write_text(",".join(names) + "\n" + ",".join("1" for _ in names) + "\n", encoding="utf-8")
+
+    settings.max_bytes = 400
+    out = describe_file(session, settings, wide.as_posix())
+    assert "200 columns" in out
+    shown = body_rows(out)
+    assert shown < 200
+    assert f"showing {shown} of 200 columns" in out
+
+
 def test_describe_missing_file(session, settings, data_dir):
     with pytest.raises(ToolError):
         describe_file(session, settings, (data_dir / "absent.parquet").as_posix())
@@ -98,6 +142,14 @@ def test_preview_file(session, settings, sales):
 
 def test_preview_shows_nulls(session, settings, sales):
     assert "NULL" in preview_file(session, settings, sales, rows=10)
+
+
+def test_preview_header_matches_the_table_after_byte_truncation(session, settings, sales):
+    settings.max_bytes = 160
+    out = preview_file(session, settings, sales, rows=20)
+    shown = body_rows(out)
+    assert f"first {shown} rows" in out
+    assert "truncated" in out
 
 
 def test_list_files_filters_to_data_files(session, settings, data_dir):
@@ -154,6 +206,29 @@ def test_profile_columns_unknown_column(session, settings, sales):
 def test_profile_columns_no_top_values(session, settings, sales):
     out = profile_columns(session, settings, sales, top_k=0)
     assert "top_values" not in out
+
+
+def test_profile_columns_scans_the_file_twice_at_most(session, settings, sales, monkeypatch):
+    """One aggregate pass plus one top-values pass, however many columns there are."""
+    real_execute = session.execute
+    scans: list[str] = []
+
+    def spy(sql, **kwargs):
+        if sales in sql and "DESCRIBE" not in sql:
+            scans.append(sql)
+        return real_execute(sql, **kwargs)
+
+    monkeypatch.setattr(session, "execute", spy)
+    profile_columns(session, settings, sales, top_k=3)
+    assert len(scans) == 2
+
+
+def test_profile_columns_reports_truncated_table(session, settings, sales):
+    settings.max_bytes = 250
+    out = profile_columns(session, settings, sales)
+    shown = body_rows(out)
+    assert shown < 4
+    assert f"showing {shown} of 4 columns" in out
 
 
 def test_join_across_formats(session, settings, data_dir):

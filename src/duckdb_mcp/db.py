@@ -5,20 +5,34 @@ from __future__ import annotations
 import re
 import sys
 import threading
-from typing import Any, Iterable, Sequence
+import time
+from typing import Any, Iterable
 
 import duckdb
 
 # Statement kinds a strictly read-only server will run. Everything else --
-# INSERT, CREATE, COPY (which writes files), ATTACH, SET, PRAGMA, ... -- is
-# rejected before it reaches DuckDB.
+# INSERT, CREATE, COPY (which writes files), ATTACH, SET, mutating PRAGMAs,
+# ... -- is rejected before it reaches DuckDB. EXPLAIN is allowed only after
+# the statement it wraps has itself been checked; see assert_read_only.
 ALLOWED_STATEMENTS = frozenset({"SELECT", "EXPLAIN"})
 
 _LEADING_KEYWORD = re.compile(r"^\s*([a-zA-Z_]+)")
 
+# Splits `EXPLAIN [ANALYZE | (opt, ...)] <statement>` into its option list (if
+# any) and the statement being explained.
+_EXPLAIN_PREFIX = re.compile(
+    r"^\s*EXPLAIN\s*(?:\(([^)]*)\)|\b(ANALYZE)\b)?\s*",
+    re.IGNORECASE,
+)
+
 # Fallback keyword allowlist, used only when the installed DuckDB is too old to
-# expose extract_statements().
-_READ_ONLY_KEYWORDS = frozenset({"select", "with", "from", "describe", "explain", "summarize", "show", "table", "values"})
+# expose extract_statements(). EXPLAIN is deliberately absent: it is reported
+# as its own kind so the ANALYZE check below still runs.
+_READ_ONLY_KEYWORDS = frozenset({"select", "with", "from", "describe", "summarize", "show", "table", "values"})
+
+# A statement handed a fully spent time budget still needs a non-zero timeout,
+# because zero means "no limit" to DuckDBSession.execute.
+_MIN_TIME_SLICE = 0.001
 
 _COMPRESSION_SUFFIXES = (".gz", ".zst", ".bz2", ".br")
 
@@ -91,6 +105,8 @@ def statement_kinds(con: duckdb.DuckDBPyConnection, sql: str) -> list[str]:
     if extract is None:  # pragma: no cover - depends on DuckDB version
         keyword = _LEADING_KEYWORD.match(sql)
         word = keyword.group(1).lower() if keyword else ""
+        if word == "explain":
+            return ["EXPLAIN"]
         return ["SELECT" if word in _READ_ONLY_KEYWORDS else word.upper() or "INVALID"]
     kinds = []
     for statement in extract(sql):
@@ -99,8 +115,12 @@ def statement_kinds(con: duckdb.DuckDBPyConnection, sql: str) -> list[str]:
     return kinds
 
 
-def assert_read_only(con: duckdb.DuckDBPyConnection, sql: str) -> None:
-    """Reject anything that is not a single read-only statement."""
+def assert_read_only(con: duckdb.DuckDBPyConnection, sql: str, _depth: int = 0) -> str:
+    """Reject anything that is not a single read-only statement.
+
+    Returns the DuckDB statement kind, which callers use to decide how the
+    statement can be run.
+    """
     if not sql or not sql.strip():
         raise ValueError("sql must not be empty")
     try:
@@ -119,6 +139,53 @@ def assert_read_only(con: duckdb.DuckDBPyConnection, sql: str) -> None:
             f"This server is read-only; {kind} statements are not allowed. "
             "Use SELECT (DESCRIBE / SUMMARIZE / SHOW are fine) or EXPLAIN."
         )
+    if kind == "EXPLAIN" and _depth == 0:
+        _assert_explain_read_only(con, sql)
+    return kind
+
+
+def _assert_explain_read_only(con: duckdb.DuckDBPyConnection, sql: str) -> None:
+    """Check the statement an EXPLAIN wraps.
+
+    DuckDB reports `EXPLAIN ANALYZE <anything>` as a plain EXPLAIN, but ANALYZE
+    *runs* the statement it wraps -- `EXPLAIN ANALYZE COPY (...) TO 'f.csv'`
+    would write a file. Plain EXPLAIN only plans, but a write there is a
+    mistake either way, so both are rejected.
+    """
+    match = _EXPLAIN_PREFIX.match(sql)
+    if match is None:  # pragma: no cover - the parser already said this is EXPLAIN
+        raise ReadOnlyViolation("Could not determine what this EXPLAIN wraps; refusing to run it.")
+    options, analyze = match.group(1), match.group(2)
+    if analyze or (options and re.search(r"\bANALYZE\b", options, re.IGNORECASE)):
+        raise ReadOnlyViolation(
+            "EXPLAIN ANALYZE executes the statement it wraps, so it is not read-only. "
+            "Use plain EXPLAIN for the query plan."
+        )
+    inner = sql[match.end() :].strip().rstrip(";").strip()
+    if not inner:
+        raise ReadOnlyViolation("EXPLAIN needs a statement to explain.")
+    assert_read_only(con, inner, _depth=1)
+
+
+class TimeBudget:
+    """One wall-clock allowance shared by every statement in a tool call.
+
+    ``DuckDBSession.execute`` applies its timeout per statement, so a tool that
+    issues several queries would otherwise be handed a fresh full timeout for
+    each of them -- turning the configured limit into a per-statement figure
+    rather than the server-wide cap it is documented to be.
+    """
+
+    __slots__ = ("_deadline",)
+
+    def __init__(self, seconds: float | None) -> None:
+        self._deadline = time.monotonic() + seconds if seconds and seconds > 0 else None
+
+    def remaining(self) -> float:
+        """Seconds left, or ``0.0`` meaning unlimited -- what ``execute`` expects."""
+        if self._deadline is None:
+            return 0.0
+        return max(self._deadline - time.monotonic(), _MIN_TIME_SLICE)
 
 
 class DuckDBSession:
@@ -169,14 +236,24 @@ class DuckDBSession:
                 "CREATE OR REPLACE SECRET duckdb_mcp_aws (TYPE s3, PROVIDER credential_chain)"
             ])
 
+    def budget(self, seconds: float | None = None) -> TimeBudget:
+        """A time allowance for one tool call, defaulting to the server limit."""
+        return TimeBudget(self.default_timeout if seconds is None else seconds)
+
     def execute(
         self,
         sql: str,
         *,
         timeout: float | None = None,
         read_only: bool = True,
+        max_rows: int | None = None,
     ) -> tuple[list[str], list[tuple[Any, ...]]]:
-        """Run ``sql`` and return ``(column_names, rows)``."""
+        """Run ``sql`` and return ``(column_names, rows)``.
+
+        ``max_rows`` caps how many rows are pulled into Python. DuckDB streams
+        the result, so this keeps an unbounded ``SELECT *`` from materialising
+        even when no LIMIT could be pushed into the statement itself.
+        """
         if read_only:
             assert_read_only(self._con, sql)
         limit = self.default_timeout if timeout is None else timeout
@@ -197,7 +274,7 @@ class DuckDBSession:
                 timer.start()
             result = cursor.execute(sql)
             columns = [d[0] for d in result.description] if result.description else []
-            rows = result.fetchall()
+            rows = result.fetchall() if max_rows is None else result.fetchmany(max_rows)
             return columns, rows
         except duckdb.Error as exc:
             if interrupted.is_set():
@@ -210,14 +287,6 @@ class DuckDBSession:
                 timer.cancel()
             cursor.close()
 
-    def scalar(self, sql: str, *, timeout: float | None = None) -> Any:
-        _, rows = self.execute(sql, timeout=timeout)
-        return rows[0][0] if rows and rows[0] else None
-
-    def column_names(self, source: str, *, timeout: float | None = None) -> list[str]:
-        columns, _ = self.execute(f"SELECT * FROM {source} LIMIT 0", timeout=timeout)
-        return columns
-
 
 def format_duckdb_error(exc: duckdb.Error) -> str:
     """Flatten a DuckDB error into a single readable line."""
@@ -228,7 +297,3 @@ def format_duckdb_error(exc: duckdb.Error) -> str:
 def log(message: str) -> None:
     """Write a diagnostic line to stderr (stdout is the MCP transport)."""
     print(f"[duckdb-mcp] {message}", file=sys.stderr, flush=True)
-
-
-def head(rows: Sequence[tuple[Any, ...]], n: int) -> list[tuple[Any, ...]]:
-    return list(rows[:n])

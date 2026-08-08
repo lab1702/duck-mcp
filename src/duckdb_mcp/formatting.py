@@ -30,6 +30,25 @@ def format_cell(value: Any) -> str:
     return text.replace("|", "\\|")
 
 
+def format_bytes(count: int) -> str:
+    """Render a byte cap for a truncation note, without flooring to ``0KB``."""
+    if count >= 1024 * 1024:
+        return f"{count / (1024 * 1024):.0f}MB"
+    if count >= 1024:
+        return f"{count // 1024}KB"
+    return f"{count}B"
+
+
+def truncation_note(emitted: int, total: int, max_bytes: int, unit: str = "rows") -> str | None:
+    """Describe a byte-capped table, or ``None`` when nothing was dropped."""
+    if emitted >= total:
+        return None
+    return (
+        f"(showing {emitted:,} of {total:,} {unit}; "
+        f"output truncated at ~{format_bytes(max_bytes)})"
+    )
+
+
 def to_markdown_table(
     columns: Sequence[str],
     rows: Sequence[Sequence[Any]],
@@ -68,11 +87,16 @@ def render_result(
     header: str | None = None,
     empty_note: str = "(0 rows)",
 ) -> str:
-    """Render a full tool response: optional header, table, truncation notes."""
+    """Render a full tool response: optional header, table, truncation notes.
+
+    ``header`` may contain the placeholder ``{rows}``, which is filled in with
+    the number of rows the table ends up containing -- the byte cap is applied
+    while rendering, so that count is not known until afterwards.
+    """
     parts: list[str] = []
-    if header:
-        parts.append(header)
     if not rows:
+        if header:
+            parts.append(header.replace("{rows}", "0"))
         parts.append(empty_note if not columns else to_markdown_table(columns, [])[0])
         if columns:
             parts.append(empty_note)
@@ -80,6 +104,8 @@ def render_result(
 
     shown = list(rows[:max_rows])
     table, emitted = to_markdown_table(columns, shown, max_bytes=max_bytes)
+    if header:
+        parts.append(header.replace("{rows}", f"{emitted:,}"))
     parts.append(table)
 
     notes: list[str] = []
@@ -88,7 +114,7 @@ def render_result(
     elif emitted < len(rows) or len(rows) > max_rows:
         notes.append(f"showing first {emitted:,} rows (more available)")
     if emitted < len(shown):
-        notes.append(f"output truncated at ~{max_bytes // 1024}KB")
+        notes.append(f"output truncated at ~{format_bytes(max_bytes)}")
     if notes:
         parts.append("(" + "; ".join(notes) + ")")
     return "\n\n".join(parts)
