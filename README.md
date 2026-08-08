@@ -33,12 +33,8 @@ curl -LsSf https://astral.sh/uv/install.sh | sh   # macOS / Linux
 ### Claude Code
 
 ```bash
-claude mcp add -s user duckdb -- uvx --refresh --from git+https://github.com/lab1702/duck-mcp duckdb-mcp
+claude mcp add -s user duckdb -- uvx --from git+https://github.com/lab1702/duck-mcp duckdb-mcp
 ```
-
-`--refresh` re-checks the repository on every start, so each new Claude Code
-session runs the current `main`. Drop it if you would rather pin to whatever
-`uvx` cached the first time and update on your own schedule.
 
 `-s user` registers the server for every project. Without it, `claude mcp add`
 defaults to `local` scope and the server is only available in the directory you
@@ -56,7 +52,6 @@ Desktop):
     "duckdb": {
       "command": "uvx",
       "args": [
-        "--refresh",
         "--from",
         "git+https://github.com/lab1702/duck-mcp",
         "duckdb-mcp"
@@ -66,9 +61,9 @@ Desktop):
 }
 ```
 
-No clone, no virtualenv, no `pip install`. The first start downloads and
-resolves; later ones reuse the cache unless `--refresh` finds the repository has
-moved, which costs a network round-trip at startup and needs you to be online.
+No clone, no virtualenv, no `pip install`. `uvx` re-resolves the repository each
+time it starts the server, so a new session already runs the current `main` —
+there is no separate update step.
 
 ## Tools
 
@@ -422,7 +417,7 @@ a bad environment variable is ignored with a line on stderr.
   "mcpServers": {
     "duckdb": {
       "command": "uvx",
-      "args": ["--refresh", "--from", "git+https://github.com/lab1702/duck-mcp", "duckdb-mcp",
+      "args": ["--from", "git+https://github.com/lab1702/duck-mcp", "duckdb-mcp",
                "--max-rows", "1000", "--timeout", "300"]
     }
   }
