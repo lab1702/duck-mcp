@@ -1,4 +1,4 @@
-"""A read-only DuckDB MCP server for exploring data files."""
+"""A DuckDB MCP server for exploring and querying data files."""
 
 __version__ = "0.1.0"
 

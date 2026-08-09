@@ -1,143 +1,67 @@
-"""Read-only enforcement, path handling and the query timeout."""
+"""Statement kinds, path handling and the query timeout."""
 
 from __future__ import annotations
 
 import time
 
-import duckdb
 import pytest
 
 from duckdb_mcp.db import (
     DuckDBSession,
     QueryTimeout,
-    ReadOnlyViolation,
     TimeBudget,
-    assert_read_only,
     capability_hint,
     quote_ident,
     source_expr,
     sql_string,
+    statement_kind,
 )
 
 
 @pytest.mark.parametrize(
-    "sql",
+    ("sql", "kind"),
     [
-        "SELECT 1",
-        "  select 1  ",
-        "WITH a AS (SELECT 1) SELECT * FROM a",
-        "FROM range(3)",
-        "DESCRIBE SELECT 1",
-        "SUMMARIZE SELECT 1",
-        "SHOW TABLES",
-        "EXPLAIN SELECT 1",
+        ("SELECT 1", "SELECT"),
+        ("  select 1  ", "SELECT"),
+        ("WITH a AS (SELECT 1) SELECT * FROM a", "SELECT"),
+        ("FROM range(3)", "SELECT"),
+        # DuckDB calls all of these SELECT, which is what matters: each yields
+        # a relation, so a row cap can be pushed into it.
+        ("DESCRIBE SELECT 1", "SELECT"),
+        ("SUMMARIZE SELECT 1", "SELECT"),
+        ("SHOW TABLES", "SELECT"),
+        ("VALUES (1)", "SELECT"),
+        ("EXPLAIN SELECT 1", "EXPLAIN"),
+        ("CREATE TABLE t(i INT)", "CREATE"),
+        ("INSERT INTO t VALUES (1)", "INSERT"),
+        ("COPY (SELECT 1) TO 'out.csv'", "COPY"),
+        ("SET memory_limit='1GB'", "SET"),
+        # The last statement is the one whose result comes back.
+        ("CREATE TABLE t(i INT); SELECT 1", "SELECT"),
     ],
 )
-def test_read_only_allows_reads(session, sql):
-    assert_read_only(session.connection, sql)
-
-
-@pytest.mark.parametrize(
-    "sql",
-    [
-        "CREATE TABLE t(i INT)",
-        "INSERT INTO t VALUES (1)",
-        "DROP TABLE t",
-        "COPY (SELECT 1) TO 'out.csv'",
-        "ATTACH 'other.db'",
-        "SET memory_limit='1GB'",
-        "INSTALL httpfs",
-        "UPDATE t SET i = 2",
-        "DELETE FROM t",
-    ],
-)
-def test_read_only_rejects_writes(session, sql):
-    with pytest.raises(ReadOnlyViolation):
-        assert_read_only(session.connection, sql)
-
-
-@pytest.mark.parametrize(
-    "sql",
-    [
-        # EXPLAIN ANALYZE actually runs what it wraps, so DuckDB reporting the
-        # statement kind as EXPLAIN is not enough to call it read-only.
-        "EXPLAIN ANALYZE CREATE TABLE evil AS SELECT 42",
-        "EXPLAIN ANALYZE COPY (SELECT 1 AS x) TO 'pwned.csv'",
-        "EXPLAIN ANALYZE INSERT INTO t VALUES (1)",
-        "EXPLAIN ANALYZE INSTALL httpfs",
-        "explain\n analyze\n select 1",
-        "EXPLAIN (ANALYZE) SELECT 1",
-        "EXPLAIN (ANALYZE, FORMAT json) SELECT 1",
-        # Plain EXPLAIN only plans, but a write here is a mistake regardless.
-        "EXPLAIN CREATE TABLE evil AS SELECT 42",
-        "EXPLAIN COPY (SELECT 1 AS x) TO 'pwned.csv'",
-    ],
-)
-def test_read_only_rejects_explain_wrapping_a_write(session, sql):
-    with pytest.raises(ReadOnlyViolation):
-        assert_read_only(session.connection, sql)
-
-
-def test_explain_analyze_does_not_run_its_statement(session):
-    with pytest.raises(ReadOnlyViolation, match="ANALYZE"):
-        assert_read_only(session.connection, "EXPLAIN ANALYZE CREATE TABLE sentinel AS SELECT 42")
-    with pytest.raises(duckdb.CatalogException):
-        session.execute("SELECT * FROM sentinel")
-
-
-def test_read_only_allows_explain_options_without_analyze(session):
-    assert assert_read_only(session.connection, "EXPLAIN (FORMAT json) SELECT 1") == "EXPLAIN"
-
-
-@pytest.mark.parametrize(
-    "sql",
-    [
-        "/* plan this */ EXPLAIN SELECT 1",
-        "-- plan this\nEXPLAIN SELECT 1",
-        "/* outer /* nested */ still a comment */ EXPLAIN SELECT 1",
-        "  -- one\n  /* two */\n  EXPLAIN SELECT 1",
-    ],
-)
-def test_read_only_allows_explain_behind_a_comment(session, sql):
-    """A model may well open its SQL with a comment; that is still read-only."""
-    assert assert_read_only(session.connection, sql) == "EXPLAIN"
-
-
-@pytest.mark.parametrize(
-    "sql",
-    [
-        "/* sneaky */ EXPLAIN ANALYZE COPY (SELECT 1 AS x) TO 'pwned.csv'",
-        "-- sneaky\nEXPLAIN ANALYZE CREATE TABLE evil AS SELECT 42",
-        "/* sneaky */ EXPLAIN COPY (SELECT 1 AS x) TO 'pwned.csv'",
-    ],
-)
-def test_comments_do_not_smuggle_a_write_past_the_explain_check(session, sql):
-    with pytest.raises(ReadOnlyViolation):
-        assert_read_only(session.connection, sql)
-
-
-def test_assert_read_only_returns_the_kind(session):
-    assert assert_read_only(session.connection, "SELECT 1") == "SELECT"
-
-
-def test_read_only_rejects_multiple_statements(session):
-    with pytest.raises(ReadOnlyViolation, match="one statement"):
-        assert_read_only(session.connection, "SELECT 1; DROP TABLE t")
-
-
-def test_read_only_rejects_write_smuggled_after_select(session):
-    with pytest.raises(ReadOnlyViolation):
-        assert_read_only(session.connection, "SELECT 1; CREATE TABLE evil(i INT)")
+def test_statement_kind(session, sql, kind):
+    assert statement_kind(session.connection, sql) == kind
 
 
 def test_empty_sql_rejected(session):
     with pytest.raises(ValueError):
-        assert_read_only(session.connection, "   ")
+        statement_kind(session.connection, "   ")
 
 
-def test_execute_enforces_read_only(session):
-    with pytest.raises(ReadOnlyViolation):
-        session.execute("CREATE TABLE t(i INT)")
+def test_unparseable_sql_rejected(session):
+    with pytest.raises(ValueError, match="Could not parse"):
+        statement_kind(session.connection, "SELECT FROM WHERE")
+
+
+def test_execute_writes(session):
+    """Writes reach DuckDB; the connection outlives the call, so they persist."""
+    try:
+        session.execute("CREATE TABLE persisted(i INT)")
+        session.execute("INSERT INTO persisted VALUES (1), (2)")
+        assert session.execute("SELECT sum(i) FROM persisted")[1] == [(3,)]
+    finally:
+        session.execute("DROP TABLE IF EXISTS persisted")
 
 
 def test_execute_returns_rows(session):

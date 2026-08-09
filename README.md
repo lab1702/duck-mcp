@@ -4,18 +4,19 @@ An MCP server that lets an AI assistant explore and query data files with
 [DuckDB](https://duckdb.org) — CSV, Parquet, JSON/NDJSON, Excel, compressed
 variants, globs, `https://` URLs and `s3://` buckets.
 
-It is **strictly read-only**: only a single `SELECT` (including
-`WITH`/`DESCRIBE`/`SUMMARIZE`/`SHOW`) or `EXPLAIN` statement runs per call.
-`INSERT`, `CREATE`, `COPY … TO`, `ATTACH`, `SET` and friends are rejected
-before they reach DuckDB, so no tool call can modify data, write files or
-change server state. `EXPLAIN ANALYZE` is rejected too, because it runs the
-statement it wraps.
+Any statement DuckDB accepts runs, reads and writes alike — `CREATE`,
+`INSERT`, `COPY … TO`, `ATTACH` and `SET` included. The connection is one
+in-memory database that lives as long as the server, so tables and views
+created in one call are still there in the next; nothing touches disk unless a
+statement says so.
 
-Read-only is not the same as sandboxed. The server can read anything the user
-account running it can read — `SELECT * FROM read_text('~/.aws/credentials')`
-is a legitimate read — and it can fetch any URL. Run it as a user whose file
-access you are happy to expose, and treat the contents of the files it reads as
-untrusted input to whatever model is driving it.
+The server is therefore exactly as powerful as the user account running it. It
+can read anything that account can read — `SELECT * FROM
+read_text('~/.aws/credentials')` is a legitimate query — write wherever it can
+write, and fetch any URL. Run it as a user whose access you are happy to hand
+over, and treat the files it reads as untrusted input to whatever model is
+driving it: a CSV whose contents suggest running `COPY … TO` is now a CSV the
+model can act on.
 
 ## Install
 
@@ -79,7 +80,7 @@ Finding and reading data:
 
 | Tool | What it does |
 | --- | --- |
-| `query(sql, max_rows=None)` | Run a read-only SQL statement, returns a markdown table. Defaults to the server's row cap (500). |
+| `query(sql, max_rows=None)` | Run any DuckDB SQL statement, returns a markdown table. Defaults to the server's row cap (500). |
 | `list_files(path=".", pattern="*", recursive=False, data_files_only=True)` | List files in a directory or `s3://` prefix. Only readable data formats unless `data_files_only=False`. |
 | `describe_file(path, include_row_count=True)` | Column names, types and row count for a file or glob. |
 | `preview_file(path, rows=20)` | First N rows, so the model sees real values. |
@@ -117,6 +118,26 @@ FROM 'data/sales.parquet' s
 JOIN 'data/customers.csv' c ON c.id = s.customer_id
 GROUP BY 1
 ```
+
+### Writing
+
+Statements that write are ordinary `query` calls. An expensive intermediate is
+worth keeping, since the database outlives the call:
+
+```sql
+CREATE TABLE monthly AS
+SELECT date_trunc('month', order_date) AS month, region, sum(amount) AS total
+FROM 'data/sales_*.parquet' GROUP BY 1, 2
+```
+
+Later calls query `monthly` directly, without rescanning the parquet. It lives
+in memory and goes away with the server; `COPY monthly TO 'monthly.parquet'`
+puts it on disk, and `ATTACH 'warehouse.db'` gives you somewhere durable to
+create tables in the first place.
+
+A statement that returns no rows reports itself rather than an empty table
+(`CREATE statement completed.`), and one that changes rows returns DuckDB's own
+count of them.
 
 ### Sampling instead of the head
 

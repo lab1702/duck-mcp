@@ -20,13 +20,13 @@ from .db import (
     DuckDBSession,
     QueryTimeout,
     TimeBudget,
-    assert_read_only,
     capability_hint,
     extension_of,
     format_duckdb_error,
     quote_ident,
     source_expr,
     sql_string,
+    statement_kind,
 )
 from .formatting import (
     escape_invisibles,
@@ -153,7 +153,6 @@ def _run(
     session: DuckDBSession,
     sql: str,
     *,
-    read_only: bool = False,
     budget: TimeBudget | None = None,
     max_rows: int | None = None,
     limit: int | None = None,
@@ -161,7 +160,6 @@ def _run(
     try:
         return session.execute(
             sql,
-            read_only=read_only,
             timeout=None if budget is None else budget.remaining(),
             max_rows=max_rows,
             limit=limit,
@@ -203,20 +201,26 @@ def run_query(
     max_rows: int | None = None,
 ) -> str:
     limit = _clamp_rows(max_rows, settings.max_rows)
-    kind = assert_read_only(session.connection, sql)
+    kind = statement_kind(session.connection, sql)
     budget = session.budget()
 
     inner = sql.strip().rstrip(";").strip()
     # Asking for limit+1 rows tells us whether more exist without counting them.
-    # EXPLAIN produces a plan rather than a relation, so only the fetch-side cap
-    # applies to it; everything else also gets the cap pushed into DuckDB.
+    # Only a SELECT yields a relation the cap can be pushed into; an EXPLAIN
+    # plan, and anything that writes, run as written under the fetch-side cap.
     columns, rows = _run(
         session,
         inner,
         budget=budget,
         max_rows=limit + 1,
-        limit=None if kind == "EXPLAIN" else limit + 1,
+        limit=limit + 1 if kind == "SELECT" else None,
     )
+
+    if kind not in ("SELECT", "EXPLAIN") and not rows:
+        # DuckDB answers a statement that changed nothing measurable with an
+        # empty `Success` or `Count` column. A table of nothing under that
+        # heading says less than a sentence does.
+        return f"{kind} statement completed."
 
     return render_result(
         columns,
@@ -429,7 +433,6 @@ def _sniff_csv(
         _, rows = session.execute(
             "SELECT Delimiter, Quote, Escape, Comment, SkipRows, HasHeader, "
             f"len(Columns), Prompt FROM sniff_csv({sql_string(path)}, ignore_errors=true)",
-            read_only=False,
             timeout=budget.remaining(),
         )
     except (duckdb.Error, QueryTimeout):
@@ -1060,7 +1063,6 @@ def _reconcile(
     try:
         _, rows = session.execute(
             f"SELECT typeof(coalesce(NULL::{ref_type}, NULL::{other}))",
-            read_only=False,
             timeout=budget.remaining(),
         )
     except QueryTimeout:
@@ -1710,9 +1712,7 @@ def _top_values(
         return {}
     exprs = ", ".join(f"histogram({quote_ident(name)}::VARCHAR)" for name in columns)
     try:
-        _, rows = session.execute(
-            f"SELECT {exprs} FROM {source}", read_only=False, timeout=budget.remaining()
-        )
+        _, rows = session.execute(f"SELECT {exprs} FROM {source}", timeout=budget.remaining())
     except (duckdb.Error, QueryTimeout):
         # This pass is an extra on top of statistics the caller already has;
         # losing it must not cost them those.

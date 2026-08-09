@@ -1,34 +1,13 @@
-"""DuckDB connection setup, read-only enforcement and query execution."""
+"""DuckDB connection setup and query execution."""
 
 from __future__ import annotations
 
-import re
 import sys
 import threading
 import time
 from typing import Any, Iterable
 
 import duckdb
-
-# Statement kinds a strictly read-only server will run. Everything else --
-# INSERT, CREATE, COPY (which writes files), ATTACH, SET, mutating PRAGMAs,
-# ... -- is rejected before it reaches DuckDB. EXPLAIN is allowed only after
-# the statement it wraps has itself been checked; see assert_read_only.
-ALLOWED_STATEMENTS = frozenset({"SELECT", "EXPLAIN"})
-
-_LEADING_KEYWORD = re.compile(r"^\s*([a-zA-Z_]+)")
-
-# Splits `EXPLAIN [ANALYZE | (opt, ...)] <statement>` into its option list (if
-# any) and the statement being explained.
-_EXPLAIN_PREFIX = re.compile(
-    r"^\s*EXPLAIN\s*(?:\(([^)]*)\)|\b(ANALYZE)\b)?\s*",
-    re.IGNORECASE,
-)
-
-# Fallback keyword allowlist, used only when the installed DuckDB is too old to
-# expose extract_statements(). EXPLAIN is deliberately absent: it is reported
-# as its own kind so the ANALYZE check below still runs.
-_READ_ONLY_KEYWORDS = frozenset({"select", "with", "from", "describe", "summarize", "show", "table", "values"})
 
 # A statement handed a fully spent time budget still needs a non-zero timeout,
 # because zero means "no limit" to DuckDBSession.execute.
@@ -71,10 +50,6 @@ BINARY_EXTS = PARQUET_EXTS | EXCEL_EXTS
 # list: parquet turns up under .parq, .snappy and no extension at all, so those
 # are worth attempting rather than refusing.
 NON_PARQUET_EXTS = READABLE_EXTS - PARQUET_EXTS
-
-
-class ReadOnlyViolation(ValueError):
-    """Raised when a statement would modify data, files or server state."""
 
 
 class QueryTimeout(RuntimeError):
@@ -128,108 +103,23 @@ def source_expr(path: str) -> str:
     return literal
 
 
-def _strip_leading_comments(sql: str) -> str:
-    """Drop leading whitespace and SQL comments.
+def statement_kind(con: duckdb.DuckDBPyConnection, sql: str) -> str:
+    """The DuckDB statement kind of ``sql`` -- of its last statement, if several.
 
-    The checks below anchor on the first keyword, and a statement may
-    legitimately open with a comment -- models write them. Block comments nest
-    in DuckDB, so this counts depth rather than scanning for the first ``*/``.
-    """
-    pos, length = 0, len(sql)
-    while pos < length:
-        if sql[pos].isspace():
-            pos += 1
-        elif sql.startswith("--", pos):
-            newline = sql.find("\n", pos)
-            pos = length if newline == -1 else newline + 1
-        elif sql.startswith("/*", pos):
-            depth, scan = 1, pos + 2
-            while scan < length and depth:
-                if sql.startswith("/*", scan):
-                    depth, scan = depth + 1, scan + 2
-                elif sql.startswith("*/", scan):
-                    depth, scan = depth - 1, scan + 2
-                else:
-                    scan += 1
-            if depth:
-                # Unterminated: hand it back untouched and let the parser object.
-                return sql[pos:]
-            pos = scan
-        else:
-            break
-    return sql[pos:]
-
-
-def statement_kinds(con: duckdb.DuckDBPyConnection, sql: str) -> list[str]:
-    """Return the DuckDB statement kind of each statement in ``sql``."""
-    extract = getattr(con, "extract_statements", None)
-    if extract is None:  # pragma: no cover - depends on DuckDB version
-        keyword = _LEADING_KEYWORD.match(_strip_leading_comments(sql))
-        word = keyword.group(1).lower() if keyword else ""
-        if word == "explain":
-            return ["EXPLAIN"]
-        return ["SELECT" if word in _READ_ONLY_KEYWORDS else word.upper() or "INVALID"]
-    kinds = []
-    for statement in extract(sql):
-        raw = getattr(statement.type, "name", str(statement.type))
-        kinds.append(raw.replace("_STATEMENT", "").upper())
-    return kinds
-
-
-def assert_read_only(con: duckdb.DuckDBPyConnection, sql: str, _depth: int = 0) -> str:
-    """Reject anything that is not a single read-only statement.
-
-    Returns the DuckDB statement kind, which callers use to decide how the
-    statement can be run.
+    The last one is the one whose result comes back, and its kind decides how
+    the statement is run: only a SELECT yields a relation a row cap can be
+    pushed into.
     """
     if not sql or not sql.strip():
         raise ValueError("sql must not be empty")
     try:
-        kinds = statement_kinds(con, sql)
+        statements = con.extract_statements(sql)
     except duckdb.Error as exc:
         raise ValueError(f"Could not parse SQL: {exc}") from exc
-    if not kinds:
+    if not statements:
         raise ValueError("sql contains no statement")
-    if len(kinds) > 1:
-        raise ReadOnlyViolation(
-            f"Only one statement per call is allowed (got {len(kinds)}: {', '.join(kinds)})."
-        )
-    kind = kinds[0]
-    if kind not in ALLOWED_STATEMENTS:
-        raise ReadOnlyViolation(
-            f"This server is read-only; {kind} statements are not allowed. "
-            "Use SELECT (DESCRIBE / SUMMARIZE / SHOW are fine) or EXPLAIN."
-        )
-    if kind == "EXPLAIN" and _depth == 0:
-        _assert_explain_read_only(con, sql)
-    return kind
-
-
-def _assert_explain_read_only(con: duckdb.DuckDBPyConnection, sql: str) -> None:
-    """Check the statement an EXPLAIN wraps.
-
-    DuckDB reports `EXPLAIN ANALYZE <anything>` as a plain EXPLAIN, but ANALYZE
-    *runs* the statement it wraps -- `EXPLAIN ANALYZE COPY (...) TO 'f.csv'`
-    would write a file. Plain EXPLAIN only plans, but a write there is a
-    mistake either way, so both are rejected.
-    """
-    body = _strip_leading_comments(sql)
-    match = _EXPLAIN_PREFIX.match(body)
-    if match is None:
-        # The parser already called this an EXPLAIN, so the only way here is
-        # text the comment stripper could not get past -- an unterminated block
-        # comment, say. Refuse rather than guess at what would run.
-        raise ReadOnlyViolation("Could not determine what this EXPLAIN wraps; refusing to run it.")
-    options, analyze = match.group(1), match.group(2)
-    if analyze or (options and re.search(r"\bANALYZE\b", options, re.IGNORECASE)):
-        raise ReadOnlyViolation(
-            "EXPLAIN ANALYZE executes the statement it wraps, so it is not read-only. "
-            "Use plain EXPLAIN for the query plan."
-        )
-    inner = body[match.end() :].strip().rstrip(";").strip()
-    if not inner:
-        raise ReadOnlyViolation("EXPLAIN needs a statement to explain.")
-    assert_read_only(con, inner, _depth=1)
+    raw = getattr(statements[-1].type, "name", str(statements[-1].type))
+    return raw.replace("_STATEMENT", "").upper()
 
 
 class TimeBudget:
@@ -323,7 +213,6 @@ class DuckDBSession:
         sql: str,
         *,
         timeout: float | None = None,
-        read_only: bool = True,
         max_rows: int | None = None,
         limit: int | None = None,
     ) -> tuple[list[str], list[tuple[Any, ...]]]:
@@ -339,10 +228,9 @@ class DuckDBSession:
         ``SELECT * FROM (...)``: wrapping makes a subquery, and a subquery's
         output names must be unique, so ``SELECT 1 AS a, 2 AS a`` would come
         back as ``a, a_1``. It also keeps DESCRIBE / SUMMARIZE / SHOW working,
-        which are not valid in a subquery position.
+        which are not valid in a subquery position. Pass it only for a
+        statement that yields a relation -- DDL and DML do not.
         """
-        if read_only:
-            assert_read_only(self._con, sql)
         time_limit = self.default_timeout if timeout is None else timeout
         cursor = self._con.cursor()
         interrupted = threading.Event()

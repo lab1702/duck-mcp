@@ -8,7 +8,7 @@ import re
 import pytest
 
 from duckdb_mcp.config import HARD_MAX_ROWS
-from duckdb_mcp.db import QueryTimeout, ReadOnlyViolation
+from duckdb_mcp.db import QueryTimeout
 from duckdb_mcp.tools import (
     COVERAGE_MAX_ROWS,
     ToolError,
@@ -48,9 +48,33 @@ def test_query_reads_a_file(session, settings, sales):
     assert "East" in out and "560.5" in out
 
 
-def test_query_rejects_writes(session, settings):
-    with pytest.raises(ReadOnlyViolation):
-        run_query(session, settings, "CREATE TABLE t AS SELECT 1")
+def test_query_runs_writes(session, settings):
+    """Writes are allowed, and land in a database that outlives the call."""
+    try:
+        assert "CREATE statement completed." == run_query(
+            session, settings, "CREATE TABLE written(i INT)"
+        )
+        inserted = run_query(session, settings, "INSERT INTO written VALUES (1), (2)")
+        assert "| 2 |" in inserted  # DuckDB's own Count of affected rows
+        assert body_rows(run_query(session, settings, "SELECT * FROM written")) == 2
+    finally:
+        run_query(session, settings, "DROP TABLE IF EXISTS written")
+
+
+def test_query_writes_a_file(session, settings, tmp_path):
+    target = tmp_path / "out.csv"
+    run_query(session, settings, f"COPY (SELECT 1 AS x) TO '{target.as_posix()}'")
+    assert target.read_text(encoding="utf-8").splitlines() == ["x", "1"]
+
+
+def test_query_runs_several_statements(session, settings):
+    """The last statement's result is the one reported."""
+    try:
+        out = run_query(session, settings, "CREATE TABLE seq AS SELECT 1 AS i; SELECT i FROM seq")
+        assert "| i |" in out
+        assert body_rows(out) == 1
+    finally:
+        run_query(session, settings, "DROP TABLE IF EXISTS seq")
 
 
 def test_query_caps_rows_and_says_so(session, settings):
@@ -80,17 +104,6 @@ def test_query_supports_explain(session, settings):
     assert body_rows(out) >= 1
 
 
-def test_query_rejects_explain_analyze_write(session, settings, tmp_path):
-    target = tmp_path / "pwned.csv"
-    with pytest.raises(ReadOnlyViolation):
-        run_query(
-            session,
-            settings,
-            f"EXPLAIN ANALYZE COPY (SELECT 1 AS x) TO '{target.as_posix()}'",
-        )
-    assert not target.exists()
-
-
 def test_query_pushes_the_cap_into_duckdb(session, settings, monkeypatch):
     """The statement runs as written, with limit+1 handed to DuckDB itself."""
     real_execute = session.execute
@@ -107,8 +120,9 @@ def test_query_pushes_the_cap_into_duckdb(session, settings, monkeypatch):
     assert calls == [("SELECT * FROM range(100)", 6, 6)]
 
 
-def test_query_runs_explain_without_a_pushed_limit(session, settings, monkeypatch):
-    """EXPLAIN yields a plan, not a relation, so only the fetch-side cap applies."""
+@pytest.mark.parametrize("sql", ["EXPLAIN SELECT 1", "SET memory_limit='1GB'"])
+def test_query_pushes_no_limit_into_a_non_select(session, settings, monkeypatch, sql):
+    """Only a SELECT yields a relation to limit; the rest run as written."""
     calls: list[int | None] = []
     real_execute = session.execute
 
@@ -117,7 +131,7 @@ def test_query_runs_explain_without_a_pushed_limit(session, settings, monkeypatc
         return real_execute(sql, **kwargs)
 
     monkeypatch.setattr(session, "execute", spy)
-    run_query(session, settings, "EXPLAIN SELECT 1", max_rows=5)
+    run_query(session, settings, sql, max_rows=5)
     assert calls == [None]
 
 

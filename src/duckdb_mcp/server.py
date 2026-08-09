@@ -14,8 +14,11 @@ from .config import HARD_MAX_ROWS, Settings
 from .db import DuckDBSession, log
 
 INSTRUCTIONS = """\
-Query local and remote data files with DuckDB SQL. Nothing is ever written:
-only SELECT and EXPLAIN statements run, one per call.
+Query local and remote data files with DuckDB SQL. Any DuckDB statement runs,
+reads and writes alike -- CREATE, INSERT, COPY ... TO, ATTACH and SET included.
+The connection is one in-memory database that lives as long as the server, so
+tables and views you create stay available to later calls; writing to a file or
+a database on disk takes an explicit COPY or ATTACH.
 
 Paths are passed straight to DuckDB, so anything it can read works: local
 paths, globs (`data/*.parquet`, `data/**/*.csv`), `https://` URLs and `s3://`
@@ -90,12 +93,16 @@ async def _call(fn: Callable[..., str], *args: Any, **kwargs: Any) -> str:
 
 @mcp.tool()
 async def query(sql: str, max_rows: int | None = None) -> str:
-    """Run a read-only DuckDB SQL statement and return the rows as a markdown table.
+    """Run a DuckDB SQL statement and return the rows as a markdown table.
 
-    Only a single SELECT (including WITH/DESCRIBE/SUMMARIZE/SHOW) or EXPLAIN
-    statement is accepted; anything that writes data, files or settings is
-    rejected. Read files by quoting their path in the FROM clause, e.g.
+    Any statement DuckDB accepts runs, including ones that write: CREATE,
+    INSERT, COPY ... TO, ATTACH, SET. Read files by quoting their path in the
+    FROM clause, e.g.
     `SELECT region, sum(amount) FROM 'data/sales.parquet' GROUP BY 1`.
+
+    Tables and views created here persist in the server's in-memory database
+    for the rest of the session; to write to disk, COPY to a file or ATTACH a
+    database.
 
     Args:
         sql: The statement to run.
@@ -340,7 +347,7 @@ def _non_negative_float(text: str) -> float:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="duckdb-mcp",
-        description="Read-only DuckDB MCP server for CSV, Parquet, JSON and Excel files.",
+        description="DuckDB MCP server for CSV, Parquet, JSON and Excel files.",
     )
     parser.add_argument("--version", action="version", version=f"duckdb-mcp {__version__}")
     parser.add_argument(

@@ -1,7 +1,7 @@
 [project]
 name = "duck-mcp"
 version = "0.1.0"
-description = "MCP server exposing read-only DuckDB schema discovery and SQL query tools over CSV, Parquet, JSON, Excel and more."
+description = "MCP server exposing DuckDB schema discovery and SQL query tools over CSV, Parquet, JSON, Excel and more."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
