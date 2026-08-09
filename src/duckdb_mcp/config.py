@@ -26,13 +26,20 @@ HARD_MAX_ROWS = 10_000
 
 
 def _env_number(
-    name: str, default: Any, cast: Callable[[str], Any], minimum: float
+    name: str,
+    default: Any,
+    cast: Callable[[str], Any],
+    minimum: float,
+    maximum: float | None = None,
 ) -> Any:
     """Read a numeric setting, falling back to ``default`` on anything unusable.
 
     A bad value is reported rather than silently accepted: ``--max-rows -5``
     would otherwise turn every query into a ``LIMIT/OFFSET cannot be negative``
-    error pointing at DuckDB instead of at the misconfiguration.
+    error pointing at DuckDB instead of at the misconfiguration. A value over
+    the ceiling is reported for the same reason -- it is held to
+    ``HARD_MAX_ROWS`` at every call site regardless, and being told that beats
+    watching a cap of 50,000 quietly behave as 10,000.
     """
     raw = os.environ.get(name)
     if not raw:
@@ -45,11 +52,14 @@ def _env_number(
     if value < minimum:
         log(f"ignoring {name}={raw!r}: must be at least {minimum}; using {default}")
         return default
+    if maximum is not None and value > maximum:
+        log(f"ignoring {name}={raw!r}: must be at most {maximum}; using {default}")
+        return default
     return value
 
 
-def _env_int(name: str, default: int, minimum: int = 1) -> int:
-    return int(_env_number(name, default, int, minimum))
+def _env_int(name: str, default: int, minimum: int = 1, maximum: int | None = None) -> int:
+    return int(_env_number(name, default, int, minimum, maximum))
 
 
 def _env_float(name: str, default: float, minimum: float = 0.0) -> float:
@@ -85,7 +95,7 @@ class Settings:
     @classmethod
     def from_env(cls) -> "Settings":
         return cls(
-            max_rows=_env_int("DUCKDB_MCP_MAX_ROWS", DEFAULT_MAX_ROWS),
+            max_rows=_env_int("DUCKDB_MCP_MAX_ROWS", DEFAULT_MAX_ROWS, maximum=HARD_MAX_ROWS),
             timeout_seconds=_env_float("DUCKDB_MCP_TIMEOUT", DEFAULT_TIMEOUT_SECONDS),
             max_bytes=_env_int("DUCKDB_MCP_MAX_BYTES", DEFAULT_MAX_BYTES),
             memory_limit=_env_str("DUCKDB_MCP_MEMORY_LIMIT", DEFAULT_MEMORY_LIMIT),

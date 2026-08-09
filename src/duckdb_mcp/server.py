@@ -314,6 +314,19 @@ def _positive_int(text: str) -> int:
     return value
 
 
+def _row_cap(text: str) -> int:
+    """A row cap, held to the ceiling the help text advertises.
+
+    Every call site clamps to HARD_MAX_ROWS anyway, so accepting a larger
+    number here would only mean an operator who asked for 50,000 rows gets
+    10,000 and is never told which of the two is in force.
+    """
+    value = _positive_int(text)
+    if value > HARD_MAX_ROWS:
+        raise argparse.ArgumentTypeError(f"{text!r} must be at most {HARD_MAX_ROWS}")
+    return value
+
+
 def _non_negative_float(text: str) -> float:
     try:
         value = float(text)
@@ -332,7 +345,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=f"duckdb-mcp {__version__}")
     parser.add_argument(
         "--max-rows",
-        type=_positive_int,
+        type=_row_cap,
         default=None,
         help=f"Default row cap per query, at most {HARD_MAX_ROWS} (env DUCKDB_MCP_MAX_ROWS).",
     )

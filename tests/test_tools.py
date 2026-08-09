@@ -544,6 +544,16 @@ def test_profile_columns_unknown_column(session, settings, sales):
         profile_columns(session, settings, sales, columns=["nope"])
 
 
+@pytest.mark.parametrize("tool", [profile_columns, find_value])
+def test_an_empty_column_list_is_not_every_column(session, settings, sales, tool):
+    """Filtering a list down to nothing asks for nothing, not for all of it."""
+    args = (session, settings, sales) if tool is profile_columns else (
+        session, settings, sales, "West"
+    )
+    with pytest.raises(ToolError, match="columns is empty"):
+        tool(*args, columns=[])
+
+
 def test_profile_columns_no_top_values(session, settings, sales):
     out = profile_columns(session, settings, sales, top_k=0)
     assert "top_values" not in out

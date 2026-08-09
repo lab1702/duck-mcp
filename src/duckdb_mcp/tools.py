@@ -121,6 +121,29 @@ def _is_data_file(name: str) -> bool:
     return os.path.splitext(stem)[1] in READABLE_EXTS
 
 
+def _selected_columns(
+    described: Sequence[tuple[str, str, str]], columns: Sequence[str] | None
+) -> list[str]:
+    """The columns to work over: the ones named, or all of them.
+
+    An empty list is not "all of them". A caller that filtered a column list
+    down to nothing and passed it has asked for the opposite, and quietly
+    covering every column is both the wrong answer and the expensive one.
+    """
+    available = [name for name, _, _ in described]
+    if columns is None:
+        return available
+    if not columns:
+        raise ToolError("columns is empty; omit it to cover every column.")
+    known = set(available)
+    missing = [name for name in columns if name not in known]
+    if missing:
+        raise ToolError(
+            f"Unknown column(s): {', '.join(missing)}. Available: {', '.join(available)}"
+        )
+    return list(columns)
+
+
 def _is_nested(column_type: str) -> bool:
     upper = (column_type or "").upper()
     return upper.endswith("[]") or upper.startswith(_NESTED_TYPE_PREFIXES) or upper == "JSON"
@@ -542,16 +565,7 @@ def profile_columns(
     budget = session.budget()
     described = _describe(session, source, budget=budget)
     types = {name: ctype for name, ctype, _ in described}
-
-    if columns:
-        missing = [c for c in columns if c not in types]
-        if missing:
-            raise ToolError(
-                f"Unknown column(s): {', '.join(missing)}. Available: {', '.join(types)}"
-            )
-        selected = list(columns)
-    else:
-        selected = [name for name, _, _ in described]
+    selected = _selected_columns(described, columns)
 
     dropped = 0
     if len(selected) > PROFILE_MAX_COLUMNS:
@@ -1363,15 +1377,7 @@ def find_value(
     source = source_expr(path)
     described = _describe(session, source, budget=budget)
     types = {name: ctype for name, ctype, _ in described}
-    if columns:
-        missing = [name for name in columns if name not in types]
-        if missing:
-            raise ToolError(
-                f"Unknown column(s): {', '.join(missing)}. Available: {', '.join(types)}"
-            )
-        selected = list(columns)
-    else:
-        selected = [name for name, _, _ in described]
+    selected = _selected_columns(described, columns)
 
     dropped = max(0, len(selected) - SEARCH_MAX_COLUMNS)
     selected = selected[:SEARCH_MAX_COLUMNS]

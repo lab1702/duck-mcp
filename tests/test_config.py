@@ -8,6 +8,7 @@ from duckdb_mcp.config import (
     DEFAULT_MAX_ROWS,
     DEFAULT_MEMORY_LIMIT,
     DEFAULT_TIMEOUT_SECONDS,
+    HARD_MAX_ROWS,
     Settings,
 )
 from duckdb_mcp.server import build_parser
@@ -44,6 +45,9 @@ def test_timeout_of_zero_is_kept(monkeypatch):
         ("DUCKDB_MCP_MAX_ROWS", "-5"),
         ("DUCKDB_MCP_MAX_ROWS", "0"),
         ("DUCKDB_MCP_MAX_ROWS", "lots"),
+        # Clamped to HARD_MAX_ROWS at every call site anyway; being told which
+        # figure is in force beats watching 50,000 quietly behave as 10,000.
+        ("DUCKDB_MCP_MAX_ROWS", "50000"),
         ("DUCKDB_MCP_TIMEOUT", "-1"),
         ("DUCKDB_MCP_TIMEOUT", "soon"),
         ("DUCKDB_MCP_MAX_BYTES", "-1"),
@@ -63,6 +67,8 @@ def test_unusable_env_values_fall_back_and_are_reported(monkeypatch, capsys, nam
         ["--max-rows", "-5"],
         ["--max-rows", "0"],
         ["--max-rows", "lots"],
+        # The help text promises this ceiling, so the parser has to hold it.
+        ["--max-rows", str(HARD_MAX_ROWS + 1)],
         ["--timeout", "-1"],
         ["--max-bytes", "0"],
     ],
@@ -70,6 +76,11 @@ def test_unusable_env_values_fall_back_and_are_reported(monkeypatch, capsys, nam
 def test_cli_rejects_unusable_values(argv):
     with pytest.raises(SystemExit):
         build_parser().parse_args(argv)
+
+
+def test_cli_accepts_the_ceiling_itself():
+    """The bound is inclusive: 10,000 is the largest cap, not the first bad one."""
+    assert build_parser().parse_args(["--max-rows", str(HARD_MAX_ROWS)]).max_rows == HARD_MAX_ROWS
 
 
 def test_cli_accepts_valid_values():
