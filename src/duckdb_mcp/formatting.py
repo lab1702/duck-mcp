@@ -38,10 +38,16 @@ def escape_invisibles(text: str) -> str:
     characters -- including non-ASCII text -- are left alone. A byte-order mark
     is rendered too: DuckDB strips a leading one itself, but concatenated
     exports can carry one into the middle of a file, where nothing strips it.
+
+    A literal backslash is doubled, because otherwise the escapes are
+    ambiguous: a field holding the two characters ``\\t`` would render exactly
+    like one holding a real tab, and telling those apart is the whole job.
     """
     out = []
     for char in text:
-        if char == "﻿":
+        if char == "\\":
+            out.append("\\\\")
+        elif char == "﻿":
             out.append("<BOM>")
         elif char == "\t":
             out.append("\\t")

@@ -92,6 +92,16 @@ class ToolError(RuntimeError):
     """A user-facing failure; the message is returned to the model verbatim."""
 
 
+class ToolTimeout(ToolError):
+    """A ToolError that is only the clock running out.
+
+    Several tools catch ToolError to explain a read that failed -- a corrupt
+    file, a key that will not cast. A spent time budget makes every remaining
+    statement fail instantly, and without this distinction those explanations
+    get attached to files and columns that are perfectly fine.
+    """
+
+
 def _plural(count: int, noun: str) -> str:
     return noun if count == 1 else noun + "s"
 
@@ -135,12 +145,14 @@ def _run(
         )
     except (duckdb.Error, QueryTimeout) as exc:
         # A timeout is a user-facing outcome like any query error, so it leaves
-        # here as a ToolError rather than as a bare RuntimeError.
+        # here as a ToolError rather than as a bare RuntimeError -- but as the
+        # subclass, so a caller explaining a failed read can tell the two apart.
         text = format_duckdb_error(exc)
         # Every tool's failures come through here, `query` included, so this is
         # the one place a startup problem can be attached to the read it broke.
         hint = capability_hint(session.capabilities, sql, text)
-        raise ToolError(f"{text}\n\n{hint}" if hint else text) from exc
+        failure = ToolTimeout if isinstance(exc, QueryTimeout) else ToolError
+        raise failure(f"{text}\n\n{hint}" if hint else text) from exc
 
 
 def _describe(
@@ -397,9 +409,10 @@ def _sniff_csv(
             read_only=False,
             timeout=budget.remaining(),
         )
-    except duckdb.Error:
-        # Not a CSV after all (ndjson under a .txt name, say). The raw lines
-        # above are still the answer, so this is not worth an error.
+    except (duckdb.Error, QueryTimeout):
+        # Not a CSV after all (ndjson under a .txt name, say), or the budget ran
+        # out sniffing it. The raw lines above are still the answer, so neither
+        # is worth throwing them away for.
         return []
     if not rows:
         return []
@@ -693,8 +706,12 @@ def parquet_metadata(
             SELECT col, any_value(type),
                    CASE WHEN count(DISTINCT compression) = 1
                         THEN any_value(compression) ELSE 'mixed' END,
-                   sum(comp), sum(uncomp), sum(nulls), count(*),
+                   sum(comp), sum(uncomp), sum(nulls),
                    count(*) FILTER (lo IS NULL OR hi IS NULL),
+                   -- Comparisons, not chunks: lag() is per file, so a glob of
+                   -- N single-row-group files offers nothing to compare even
+                   -- though it has N chunks.
+                   count(*) FILTER (prev_hi IS NOT NULL),
                    count(*) FILTER (
                        prev_hi IS NOT NULL AND lo IS NOT NULL AND NOT ({_ASCENDING})
                    )
@@ -703,7 +720,7 @@ def parquet_metadata(
     )
 
     records: list[list[Any]] = []
-    for col, ctype, codec, comp, uncomp, nulls, chunks, no_stats, unordered in columns:
+    for col, ctype, codec, comp, uncomp, nulls, no_stats, compared, unordered in columns:
         comp, uncomp = int(comp or 0), int(uncomp or 0)
         records.append([
             col,
@@ -712,7 +729,7 @@ def parquet_metadata(
             format_size(comp),
             f"{uncomp / comp:.1f}x" if comp else "—",
             f"{int(nulls or 0):,}",
-            _row_group_order(int(chunks), int(no_stats), int(unordered)),
+            _row_group_order(int(compared), int(no_stats), int(unordered)),
         ])
 
     header = (
@@ -740,19 +757,25 @@ def parquet_metadata(
     )
     parts.extend(_layout_warnings(files, rows, groups, int(size or 0)))
     if row_groups:
-        parts.append(_row_group_table(session, settings, literal, budget=budget))
+        parts.append(_row_group_table(session, settings, literal, groups, budget=budget))
     return "\n\n".join(part for part in parts if part)
 
 
-def _row_group_order(chunks: int, no_stats: int, unordered: int) -> str:
-    """Summarise one column's row-group ordering for the table."""
+def _row_group_order(compared: int, no_stats: int, unordered: int) -> str:
+    """Summarise one column's row-group ordering for the table.
+
+    ``compared`` is the number of adjacent row-group pairs *within a file* --
+    the only pairs a reader can prune between. Across a glob that is fewer than
+    the chunk count by one per file, and for a glob of single-row-group files
+    it is zero: nothing is ordered relative to anything, and nothing prunes.
+    """
     if no_stats:
         return "no stats"
-    if chunks < 2:
-        return "—"  # a single row group is trivially ordered, and prunes nothing
+    if compared == 0:
+        return "—"  # a single row group per file is trivially ordered, and prunes nothing
     if unordered == 0:
         return "ascending"
-    return f"scattered ({unordered}/{chunks - 1})"
+    return f"scattered ({unordered}/{compared})"
 
 
 def _layout_warnings(files: int, rows: int, groups: int, size: int) -> list[str]:
@@ -775,9 +798,20 @@ def _layout_warnings(files: int, rows: int, groups: int, size: int) -> list[str]
 
 
 def _row_group_table(
-    session: DuckDBSession, settings: Settings, literal: str, *, budget: TimeBudget
+    session: DuckDBSession,
+    settings: Settings,
+    literal: str,
+    total_groups: int,
+    *,
+    budget: TimeBudget,
 ) -> str:
-    """Per-row-group rows and bytes, for spotting uneven splits."""
+    """Per-row-group rows and bytes, for spotting uneven splits.
+
+    ``total_groups`` comes from the footer summary the caller already read. The
+    fetch here is capped, so counting the rows it returns would only ever
+    report the cap back -- a file with ten thousand row groups would claim to
+    have as many as fit in one table.
+    """
     limit = _clamp_rows(None, settings.max_rows)
     _, rows = _run(
         session,
@@ -786,7 +820,7 @@ def _row_group_table(
         f"  FROM parquet_metadata({literal})"
         ") ORDER BY file_name, row_group_id",
         budget=budget,
-        max_rows=limit + 1,
+        max_rows=limit,
     )
     table_rows = [
         (
@@ -795,14 +829,14 @@ def _row_group_table(
             f"{int(count):,}",
             format_size(int(nbytes)),
         )
-        for name, group, count, nbytes in rows[:limit]
+        for name, group, count, nbytes in rows
     ]
     return render_result(
         ["file", "row_group", "rows", "bytes"],
         table_rows,
         max_rows=limit,
         max_bytes=settings.max_bytes,
-        total_rows=len(rows),
+        total_rows=max(total_groups, len(table_rows)),
         header="Row groups:",
     )
 
@@ -847,6 +881,14 @@ def compare_schemas(
     for name in chosen:
         try:
             described = _describe(session, source_expr(name), budget=budget)
+        except ToolTimeout as exc:
+            # Once the budget is spent every remaining file fails instantly, so
+            # swallowing this would report a directory of healthy files as
+            # entirely unreadable.
+            raise ToolTimeout(
+                f"Ran out of time after reading {len(schemas)} of {len(chosen)} schemas "
+                f"under {path}. {exc} Lower max_files, or raise the server's timeout."
+            ) from exc
         except ToolError:
             # One corrupt or empty file must not sink the comparison; it is
             # reported alongside the rest, which is itself a useful finding.
@@ -1007,6 +1049,10 @@ def _reconcile(
             read_only=False,
             timeout=budget.remaining(),
         )
+    except QueryTimeout:
+        # Running out of time says nothing about the types. Calling that
+        # "incompatible" would report a perfectly readable column as a failure.
+        return "unknown"
     except duckdb.Error:
         return "incompatible"
     if not rows:
@@ -1102,6 +1148,9 @@ def check_join(
     ]
     try:
         stats = _join_stats(session, left_src, right_src, left_keys, right_keys, aliases, budget)
+    except ToolTimeout:
+        # A spent budget is not evidence about the keys; let it say so itself.
+        raise
     except ToolError as exc:
         # Joining across types makes DuckDB cast one side, which fails on the
         # first value that will not convert. The cast is the cause, so say so
@@ -1338,21 +1387,30 @@ def find_value(
     by_file = _filename_reader(path) if any(ch in path for ch in _GLOB_CHARS) else None
     scan = by_file or source
 
+    matches = []
     tests = []
     for name in selected:
         cast = f"{quote_ident(name)}::VARCHAR"
+        matches.append(f"{cast} ILIKE {literal} ESCAPE '\\'")
         tests.append(f"count(*) FILTER ({cast} ILIKE {literal} ESCAPE '\\')")
         tests.append(f"min({cast}) FILTER ({cast} ILIKE {literal} ESCAPE '\\')")
+    # A row matching in three columns is still one row. Summing the per-column
+    # counts to describe a file would count it three times, and can exceed the
+    # file's row count outright.
+    matching_rows = f"count(*) FILTER ({' OR '.join(matches)})"
 
     if by_file:
         _, fetched = _run(
             session,
-            f"SELECT filename, count(*), {', '.join(tests)} FROM {scan} GROUP BY 1 ORDER BY 1",
+            f"SELECT filename, count(*), {matching_rows}, {', '.join(tests)} "
+            f"FROM {scan} GROUP BY 1 ORDER BY 1",
             budget=budget,
         )
     else:
         _, fetched = _run(
-            session, f"SELECT NULL, count(*), {', '.join(tests)} FROM {scan}", budget=budget
+            session,
+            f"SELECT NULL, count(*), {matching_rows}, {', '.join(tests)} FROM {scan}",
+            budget=budget,
         )
     if not fetched:
         return f"**{path}** — no rows to search."
@@ -1363,15 +1421,14 @@ def find_value(
     scanned = 0
     for row in fetched:
         scanned += int(row[1] or 0)
-        hits = 0
         for index, name in enumerate(selected):
-            count = int(row[2 + index * 2] or 0)
+            count = int(row[3 + index * 2] or 0)
             counts[name] += count
-            hits += count
-            sample = row[3 + index * 2]
+            sample = row[4 + index * 2]
             if count and name not in examples and sample is not None:
                 examples[name] = str(sample)
         if row[0] is not None:
+            hits = int(row[2] or 0)
             per_file.append((os.path.basename(str(row[0]).replace("\\", "/")), hits))
 
     matched = [name for name in selected if counts[name]]
@@ -1402,17 +1459,18 @@ def find_value(
         parts.append(note)
 
     hits_by_file = [entry for entry in per_file if entry[1]]
-    if by_file and len(per_file) > 1:
-        listed, _ = to_markdown_table(
-            ["file", "matches"],
-            [[name, f"{hits:,}"] for name, hits in hits_by_file[: settings.max_rows]],
+    if by_file and len(per_file) > 1 and hits_by_file:
+        shown = hits_by_file[: _clamp_rows(None, settings.max_rows)]
+        listed, emitted = to_markdown_table(
+            ["file", "matching rows"],
+            [[name, f"{hits:,}"] for name, hits in shown],
             max_bytes=settings.max_bytes,
         )
-        parts.append(
-            f"Found in {len(hits_by_file)} of {len(per_file)} files:\n\n{listed}"
-            if hits_by_file
-            else ""
-        )
+        parts.append(f"Found in {len(hits_by_file)} of {len(per_file)} files:\n\n{listed}")
+        if emitted < len(hits_by_file):
+            # The sentence above names every file that matched, so a shorter
+            # table than that has to say so.
+            parts.append(f"({emitted:,} of {len(hits_by_file):,} listed)")
     return "\n\n".join(part for part in parts if part)
 
 
@@ -1486,25 +1544,44 @@ def check_coverage(
             step AS (
                 SELECT o - prev_o AS d, any_value(k - prev_k) AS shown, count(*) AS freq
                 FROM s WHERE prev_o IS NOT NULL GROUP BY 1 ORDER BY freq DESC, d LIMIT 1
-            )
+            ),
+            -- Gaps and repeats are both unbounded in the data: a column of
+            -- random ids is almost all gap. Only COVERAGE_MAX_ROWS of each are
+            -- ever shown, so only that many are built -- the totals below come
+            -- from aggregates, which cost nothing to keep exact.
+            g AS (
+                SELECT prev_k AS gap_after, k AS gap_before, o AS gap_at,
+                       (round((o - prev_o) / step.d) - 1)::BIGINT AS gap_missing
+                FROM s, step
+                WHERE prev_o IS NOT NULL
+                  AND (o - prev_o) > step.d * {GAP_TOLERANCE}
+                  AND round((o - prev_o) / step.d) - 1 >= 1
+            ),
+            dup AS (SELECT k AS dup_value, n AS dup_rows FROM v WHERE n > 1)
             SELECT (SELECT coalesce(sum(n), 0) FROM v),
                    (SELECT count(*) FROM v),
                    (SELECT count(*) FROM {source} WHERE {key} IS NULL),
                    (SELECT min(k) FROM v), (SELECT max(k) FROM v),
                    (SELECT shown FROM step), (SELECT freq FROM step),
-                   (SELECT list({{'after': prev_k, 'before': k,
-                                  'missing': (round((o - prev_o) / step.d) - 1)::BIGINT}}
-                                ORDER BY o)
-                      FROM s, step
-                     WHERE prev_o IS NOT NULL
-                       AND (o - prev_o) > step.d * {GAP_TOLERANCE}
-                       AND round((o - prev_o) / step.d) - 1 >= 1),
-                   (SELECT list({{'value': k, 'rows': n}} ORDER BY n DESC, k) FROM v WHERE n > 1)
+                   (SELECT count(*) FROM g),
+                   (SELECT coalesce(sum(gap_missing), 0) FROM g),
+                   (SELECT list({{'after': gap_after, 'before': gap_before,
+                                  'missing': gap_missing}} ORDER BY gap_at)
+                      FROM (SELECT * FROM g ORDER BY gap_at LIMIT {COVERAGE_MAX_ROWS})),
+                   (SELECT count(*) FROM dup),
+                   (SELECT list({{'value': dup_value, 'rows': dup_rows}}
+                                ORDER BY dup_rows DESC, dup_value)
+                      FROM (SELECT * FROM dup ORDER BY dup_rows DESC, dup_value
+                            LIMIT {COVERAGE_MAX_ROWS}))
         """,
         budget=budget,
     )
-    total, distinct, nulls, low, high, step_shown, step_freq, gaps, dupes = rows[0]
+    (
+        total, distinct, nulls, low, high, step_shown, step_freq,
+        gap_count, missing, gaps, dupe_count, dupes,
+    ) = rows[0]
     total, distinct, nulls = int(total or 0), int(distinct or 0), int(nulls or 0)
+    gap_count, missing, dupe_count = int(gap_count or 0), int(missing or 0), int(dupe_count or 0)
 
     header = f"**{path}** — coverage of `{column}`"
     if granularity:
@@ -1519,7 +1596,6 @@ def check_coverage(
 
     gaps = gaps or []
     dupes = dupes or []
-    missing = sum(int(gap["missing"]) for gap in gaps)
     expected = distinct + missing
 
     parts = [
@@ -1530,7 +1606,9 @@ def check_coverage(
         + f". Step looks like {_format_step(step_shown, ctype)} "
         f"({step_freq:,} of {distinct - 1:,} intervals), so {expected:,} values were expected.",
     ]
-    parts.extend(_coverage_findings(settings, gaps, dupes, missing, expected))
+    parts.extend(
+        _coverage_findings(settings, gaps, gap_count, dupes, dupe_count, missing, expected)
+    )
     return "\n\n".join(part for part in parts if part)
 
 
@@ -1557,48 +1635,52 @@ def _format_step(value: Any, ctype: str) -> str:
 def _coverage_findings(
     settings: Settings,
     gaps: Sequence[dict[str, Any]],
+    gap_count: int,
     dupes: Sequence[dict[str, Any]],
+    dupe_count: int,
     missing: int,
     expected: int,
 ) -> list[str]:
-    """Tables for the holes and the repeats, or a clean bill of health."""
-    if not gaps and not dupes:
+    """Tables for the holes and the repeats, or a clean bill of health.
+
+    ``gaps`` and ``dupes`` are already capped by the query that built them, so
+    the counts they are described by come in separately.
+    """
+    if not gap_count and not dupe_count:
         return ["No gaps and no repeats: every step is present exactly once."]
 
     parts = []
-    if gaps:
-        shown = list(gaps)[:COVERAGE_MAX_ROWS]
+    if gap_count:
         table, _ = to_markdown_table(
             ["after", "before", "missing"],
             [[format_cell(g["after"]), format_cell(g["before"]), f"{int(g['missing']):,}"]
-             for g in shown],
+             for g in gaps],
             max_bytes=settings.max_bytes,
         )
         share = missing / expected * 100 if expected else 0
         note = (
             f"**{missing:,} missing** ({share:.1f}% of the expected range) across "
-            f"{len(gaps):,} {_plural(len(gaps), 'gap')}. A total over this range is "
+            f"{gap_count:,} {_plural(gap_count, 'gap')}. A total over this range is "
             "short by whatever those held."
         )
         parts.append(note)
         parts.append(table)
-        if len(gaps) > len(shown):
-            parts.append(f"({len(shown):,} of {len(gaps):,} gaps shown)")
+        if gap_count > len(gaps):
+            parts.append(f"({len(gaps):,} of {gap_count:,} gaps shown)")
 
-    if dupes:
-        shown = list(dupes)[:COVERAGE_MAX_ROWS]
+    if dupe_count:
         table, _ = to_markdown_table(
             ["value", "rows"],
-            [[format_cell(d["value"]), f"{int(d['rows']):,}"] for d in shown],
+            [[format_cell(d["value"]), f"{int(d['rows']):,}"] for d in dupes],
             max_bytes=settings.max_bytes,
         )
         parts.append(
-            f"**{len(dupes):,} repeated {_plural(len(dupes), 'value')}.** A sum over this "
+            f"**{dupe_count:,} repeated {_plural(dupe_count, 'value')}.** A sum over this "
             "column double-counts them — often a period loaded twice."
         )
         parts.append(table)
-        if len(dupes) > len(shown):
-            parts.append(f"({len(shown):,} of {len(dupes):,} repeats shown)")
+        if dupe_count > len(dupes):
+            parts.append(f"({len(dupes):,} of {dupe_count:,} repeats shown)")
     return parts
 
 
@@ -1625,7 +1707,9 @@ def _top_values(
         _, rows = session.execute(
             f"SELECT {exprs} FROM {source}", read_only=False, timeout=budget.remaining()
         )
-    except duckdb.Error:
+    except (duckdb.Error, QueryTimeout):
+        # This pass is an extra on top of statistics the caller already has;
+        # losing it must not cost them those.
         return {}
     if not rows:
         return {}

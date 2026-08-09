@@ -44,6 +44,13 @@ def test_escape_invisibles_leaves_real_text_alone():
     assert escape_invisibles("café — naïve, 日本語") == "café — naïve, 日本語"
 
 
+def test_escape_invisibles_distinguishes_a_real_tab_from_the_text_backslash_t():
+    """Undoubled, the escapes would be ambiguous at the one job they have."""
+    assert escape_invisibles("a\tb") != escape_invisibles("a\\tb")
+    assert escape_invisibles("a\\tb") == "a\\\\tb"
+    assert escape_invisibles("C:\\data\\x.csv") == "C:\\\\data\\\\x.csv"
+
+
 def test_format_cell_handles_specials():
     assert format_cell(None) == "NULL"
     assert format_cell(True) == "true"

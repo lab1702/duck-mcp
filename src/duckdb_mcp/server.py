@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-import functools
+import threading
 from typing import Any, Callable, Sequence
 
 import anyio.to_thread
@@ -49,24 +49,43 @@ the schema is not yet known.
 
 settings = Settings.from_env()
 _session: DuckDBSession | None = None
+# Built in a worker thread, so two first calls could arrive at once.
+_session_lock = threading.Lock()
 
 mcp = MCPServer("duckdb", instructions=INSTRUCTIONS, version=__version__)
 
 
 def get_session() -> DuckDBSession:
-    """Create the shared in-memory DuckDB instance on first use."""
+    """Create the shared in-memory DuckDB instance on first use.
+
+    Blocking, and on the first call substantially so: setup installs httpfs and
+    excel and resolves AWS credentials, all over the network. Only ever called
+    from ``_call``'s worker thread for that reason.
+    """
     global _session
-    if _session is None:
-        _session = DuckDBSession(
-            default_timeout=settings.timeout_seconds, memory_limit=settings.memory_limit
-        )
-        log(f"duckdb-mcp {__version__} ready; extensions: {_session.capabilities}")
-    return _session
+    with _session_lock:
+        if _session is None:
+            _session = DuckDBSession(
+                default_timeout=settings.timeout_seconds, memory_limit=settings.memory_limit
+            )
+            log(f"duckdb-mcp {__version__} ready; extensions: {_session.capabilities}")
+        return _session
 
 
 async def _call(fn: Callable[..., str], *args: Any, **kwargs: Any) -> str:
-    """Run a blocking tool implementation off the event loop."""
-    return await anyio.to_thread.run_sync(functools.partial(fn, *args, **kwargs))
+    """Run a blocking tool implementation off the event loop.
+
+    The session is resolved inside that thread too, which is why this closes
+    over the call rather than binding it with ``partial``: an argument -- even
+    to ``partial`` -- is evaluated on the event loop, so the first tool call
+    would stall the whole server, pings included, for as long as installing
+    extensions over the network takes.
+    """
+
+    def run() -> str:
+        return fn(get_session(), settings, *args, **kwargs)
+
+    return await anyio.to_thread.run_sync(run)
 
 
 @mcp.tool()
@@ -82,7 +101,7 @@ async def query(sql: str, max_rows: int | None = None) -> str:
         sql: The statement to run.
         max_rows: Row cap for this call (defaults to the server's limit).
     """
-    return await _call(tools.run_query, get_session(), settings, sql, max_rows)
+    return await _call(tools.run_query, sql, max_rows)
 
 
 @mcp.tool()
@@ -96,7 +115,7 @@ async def describe_file(path: str, include_row_count: bool = True) -> str:
         path: File path, glob or URL, e.g. 'data/sales_*.parquet'.
         include_row_count: Set False to skip counting rows on very large inputs.
     """
-    return await _call(tools.describe_file, get_session(), settings, path, include_row_count)
+    return await _call(tools.describe_file, path, include_row_count)
 
 
 @mcp.tool()
@@ -107,7 +126,7 @@ async def preview_file(path: str, rows: int = 20) -> str:
         path: File path, glob or URL.
         rows: How many rows to show (default 20).
     """
-    return await _call(tools.preview_file, get_session(), settings, path, rows)
+    return await _call(tools.preview_file, path, rows)
 
 
 @mcp.tool()
@@ -123,7 +142,7 @@ async def sample_rows(path: str, rows: int = 20, seed: int | None = None) -> str
         rows: How many rows to sample (default 20).
         seed: Fix the draw so repeated calls return the same rows.
     """
-    return await _call(tools.sample_rows, get_session(), settings, path, rows, seed)
+    return await _call(tools.sample_rows, path, rows, seed)
 
 
 @mcp.tool()
@@ -141,7 +160,7 @@ async def inspect_raw(path: str, lines: int = 20) -> str:
         path: File path or URL of a text file (csv, tsv, json, ndjson, txt).
         lines: How many lines to show (default 20).
     """
-    return await _call(tools.inspect_raw, get_session(), settings, path, lines)
+    return await _call(tools.inspect_raw, path, lines)
 
 
 @mcp.tool()
@@ -159,9 +178,7 @@ async def list_files(
         recursive: Descend into subdirectories.
         data_files_only: Keep only extensions DuckDB can read; set False to see everything.
     """
-    return await _call(
-        tools.list_files, get_session(), settings, path, pattern, recursive, data_files_only
-    )
+    return await _call(tools.list_files, path, pattern, recursive, data_files_only)
 
 
 @mcp.tool()
@@ -180,7 +197,7 @@ async def profile_columns(
         columns: Restrict to these columns (default: all).
         top_k: Number of most-frequent values to show; 0 to skip that pass.
     """
-    return await _call(tools.profile_columns, get_session(), settings, path, columns, top_k)
+    return await _call(tools.profile_columns, path, columns, top_k)
 
 
 @mcp.tool()
@@ -197,7 +214,7 @@ async def parquet_metadata(path: str, row_groups: bool = False) -> str:
         path: Parquet file path, glob or URL.
         row_groups: Also list each row group's row count and size.
     """
-    return await _call(tools.parquet_metadata, get_session(), settings, path, row_groups)
+    return await _call(tools.parquet_metadata, path, row_groups)
 
 
 @mcp.tool()
@@ -216,7 +233,7 @@ async def compare_schemas(path: str, max_files: int | None = None) -> str:
         max_files: How many files to read schemas from (default 100, spread
             across the glob rather than taken from the front).
     """
-    return await _call(tools.compare_schemas, get_session(), settings, path, max_files)
+    return await _call(tools.compare_schemas, path, max_files)
 
 
 @mcp.tool()
@@ -240,9 +257,7 @@ async def check_join(
         left_on: Key column(s) in the left file.
         right_on: Key column(s) in the right file (defaults to left_on).
     """
-    return await _call(
-        tools.check_join, get_session(), settings, left, right, left_on, right_on
-    )
+    return await _call(tools.check_join, left, right, left_on, right_on)
 
 
 @mcp.tool()
@@ -265,9 +280,7 @@ async def find_value(
         columns: Restrict the search to these columns (default: all).
         exact: Match the whole value instead of any substring of it.
     """
-    return await _call(
-        tools.find_value, get_session(), settings, path, value, columns, exact
-    )
+    return await _call(tools.find_value, path, value, columns, exact)
 
 
 @mcp.tool()
@@ -287,9 +300,7 @@ async def check_coverage(path: str, column: str, granularity: str | None = None)
             day, hour, minute or second. Needed when timestamps carry a time
             of day but the data is really per-day.
     """
-    return await _call(
-        tools.check_coverage, get_session(), settings, path, column, granularity
-    )
+    return await _call(tools.check_coverage, path, column, granularity)
 
 
 def _positive_int(text: str) -> int:

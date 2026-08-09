@@ -8,9 +8,11 @@ import re
 import pytest
 
 from duckdb_mcp.config import HARD_MAX_ROWS
-from duckdb_mcp.db import ReadOnlyViolation
+from duckdb_mcp.db import QueryTimeout, ReadOnlyViolation
 from duckdb_mcp.tools import (
+    COVERAGE_MAX_ROWS,
     ToolError,
+    ToolTimeout,
     check_coverage,
     check_join,
     compare_schemas,
@@ -562,6 +564,39 @@ def test_profile_columns_scans_the_file_twice_at_most(session, settings, sales, 
     assert len(scans) == 2
 
 
+def test_profile_columns_keeps_its_statistics_when_top_values_times_out(
+    session, settings, sales, monkeypatch
+):
+    """The top-values pass is an extra; losing it must not cost the whole report."""
+    real = session.execute
+
+    def spy(sql, **kwargs):
+        if "histogram(" in sql:
+            raise QueryTimeout("Query exceeded the 1s time limit and was cancelled.")
+        return real(sql, **kwargs)
+
+    monkeypatch.setattr(session, "execute", spy)
+    out = profile_columns(session, settings, sales, top_k=3)
+    assert "| region |" in out  # the statistics that were already computed
+    assert "top_values" not in out
+
+
+def test_inspect_raw_keeps_its_lines_when_the_sniffer_times_out(
+    session, settings, malformed, monkeypatch
+):
+    real = session.execute
+
+    def spy(sql, **kwargs):
+        if "sniff_csv(" in sql:
+            raise QueryTimeout("Query exceeded the 1s time limit and was cancelled.")
+        return real(sql, **kwargs)
+
+    monkeypatch.setattr(session, "execute", spy)
+    out = inspect_raw(session, settings, str(malformed))
+    assert "```text" in out
+    assert "CSV sniffer" not in out
+
+
 def test_profile_columns_reports_truncated_table(session, settings, sales):
     settings.max_bytes = 250
     out = profile_columns(session, settings, sales)
@@ -668,6 +703,58 @@ def test_parquet_metadata_lists_row_groups_on_request(session, settings, layout_
     out = parquet_metadata(session, settings, path, row_groups=True)
     assert "| file | row_group | rows | bytes |" in out
     assert "sorted.parquet" in out
+
+
+def test_parquet_metadata_counts_row_groups_it_did_not_list(session, settings, layout_dir):
+    """The total comes from the footer, not from the capped fetch behind the table."""
+    settings.max_rows = 2
+    out = parquet_metadata(
+        session, settings, (layout_dir / "sorted.parquet").as_posix(), row_groups=True
+    )
+    assert "6 row groups" in out
+    assert "showing 2 of 6 rows" in out
+
+
+@pytest.fixture(scope="session")
+def glob_layout(tmp_path_factory):
+    """Two globs whose row-group ordering only reads correctly per file."""
+    import duckdb
+
+    directory = tmp_path_factory.mktemp("globlayout")
+    con = duckdb.connect(":memory:")
+    same = directory / "same"
+    same.mkdir()
+    for part in range(4):
+        # One row group each, all covering the identical range.
+        con.execute(
+            "COPY (SELECT i AS id FROM range(1000) t(i)) TO "
+            f"'{(same / f'p{part}.parquet').as_posix()}' (ROW_GROUP_SIZE 100000)"
+        )
+    mixed = directory / "mixed"
+    mixed.mkdir()
+    for part in range(3):
+        # Three shuffled row groups each: every within-file pair is out of order.
+        con.execute(
+            "COPY (SELECT i AS id FROM range(30000) t(i) ORDER BY hash(i)) TO "
+            f"'{(mixed / f'p{part}.parquet').as_posix()}' (ROW_GROUP_SIZE 10000)"
+        )
+    con.close()
+    return directory
+
+
+def test_parquet_metadata_does_not_call_separate_files_ordered(session, settings, glob_layout):
+    """Row groups only prune within a file, so four files are not a sorted sequence."""
+    out = parquet_metadata(session, settings, (glob_layout / "same" / "*.parquet").as_posix())
+    assert "4 parquet files" in out
+    # Each file holds one row group covering 0..999. Nothing can be skipped, and
+    # saying "ascending" would promise pruning the legend then explains.
+    assert "ascending" not in row_for(out, "id")
+
+
+def test_parquet_metadata_counts_comparisons_within_each_file(session, settings, glob_layout):
+    """3 files x 3 row groups is 6 adjacent pairs to compare, not 8."""
+    out = parquet_metadata(session, settings, (glob_layout / "mixed" / "*.parquet").as_posix())
+    assert "scattered (6/6)" in row_for(out, "id")
 
 
 def test_parquet_metadata_rejects_a_non_parquet_file(session, settings, data_dir):
@@ -865,6 +952,39 @@ def test_compare_schemas_reports_no_match(session, settings, tmp_path):
         compare_schemas(session, settings, (tmp_path / "*.parquet").as_posix())
 
 
+def time_out_on(session, monkeypatch, marker: str):
+    """Make every statement containing ``marker`` behave as a spent time budget."""
+    real = session.execute
+
+    def spy(sql, **kwargs):
+        if marker in sql:
+            raise QueryTimeout("Query exceeded the 1s time limit and was cancelled.")
+        return real(sql, **kwargs)
+
+    monkeypatch.setattr(session, "execute", spy)
+
+
+def test_compare_schemas_calls_a_timeout_a_timeout_not_a_corrupt_file(
+    session, settings, tmp_path, monkeypatch
+):
+    """A spent budget fails every remaining file, which is not evidence about them."""
+    write_parquet(tmp_path, ["SELECT 1 AS id", "SELECT 2 AS id", "SELECT 3 AS id"])
+    time_out_on(session, monkeypatch, "b.parquet")
+    with pytest.raises(ToolTimeout, match="Ran out of time after reading 1 of 3 schemas"):
+        compare_schemas(session, settings, (tmp_path / "*.parquet").as_posix())
+
+
+def test_compare_schemas_does_not_call_a_timed_out_cast_incompatible(
+    session, settings, tmp_path, monkeypatch
+):
+    """_reconcile falling back to "incompatible" would fail a readable column."""
+    write_parquet(tmp_path, ["SELECT 1::INTEGER AS id", "SELECT 2::BIGINT AS id"])
+    time_out_on(session, monkeypatch, "typeof(coalesce(")
+    out = compare_schemas(session, settings, (tmp_path / "*.parquet").as_posix())
+    assert "cannot read" not in out
+    assert "Read fails on" not in out
+
+
 @pytest.fixture(scope="session")
 def join_dir(tmp_path_factory):
     """Order/customer files shaped to exercise each join pathology."""
@@ -981,6 +1101,22 @@ def test_check_join_explains_a_type_mismatch(session, settings, join_dir):
     assert "VARCHAR" in message and "BIGINT" in message
 
 
+def test_check_join_does_not_blame_a_timeout_on_the_key_types(
+    session, settings, join_dir, monkeypatch
+):
+    """Mismatched types are a standing fact; they did not cause the clock to run out."""
+    time_out_on(session, monkeypatch, "GROUP BY")
+    with pytest.raises(ToolTimeout) as excinfo:
+        check_join(
+            session, settings,
+            (join_dir / "strkeys.parquet").as_posix(),
+            (join_dir / "clean.parquet").as_posix(),
+            ["cust"], ["id"],
+        )
+    assert "key types do not match" not in str(excinfo.value)
+    assert "time limit" in str(excinfo.value)
+
+
 def test_check_join_supports_composite_keys(session, settings, tmp_path):
     import duckdb
 
@@ -1089,6 +1225,42 @@ def test_find_value_reports_which_file(session, settings, search_dir):
     out = find_value(session, settings, (search_dir / "parts" / "*.parquet").as_posix(), "NEEDLE")
     assert "Found in 1 of 3 files" in out
     assert "p1.parquet" in out
+
+
+@pytest.fixture(scope="session")
+def wide_search_dir(tmp_path_factory):
+    """Files where the needle sits in two columns of the same row."""
+    import duckdb
+
+    directory = tmp_path_factory.mktemp("widesearch")
+    con = duckdb.connect(":memory:")
+    for index in range(4):
+        con.execute(
+            "COPY (SELECT 'NEEDLE' AS a, 'NEEDLE' AS b, 'x' AS c FROM range(3)) TO "
+            f"'{(directory / f'w{index}.parquet').as_posix()}'"
+        )
+    con.close()
+    return directory
+
+
+def test_find_value_counts_a_file_by_rows_not_by_column_hits(
+    session, settings, wide_search_dir
+):
+    """A row matching in two columns is one row; counting it twice can beat the file."""
+    out = find_value(session, settings, (wide_search_dir / "*.parquet").as_posix(), "NEEDLE")
+    assert "| matching rows |" in out
+    # Three rows per file, each matching in both a and b -- not six.
+    assert "| w0.parquet | 3 |" in out
+    assert "| w0.parquet | 6 |" not in out
+
+
+def test_find_value_says_when_the_file_list_is_cut_short(
+    session, settings, wide_search_dir
+):
+    settings.max_rows = 2
+    out = find_value(session, settings, (wide_search_dir / "*.parquet").as_posix(), "NEEDLE")
+    assert "Found in 4 of 4 files" in out
+    assert "(2 of 4 listed)" in out
 
 
 def test_find_value_says_when_absent(session, settings, search_dir):
@@ -1242,6 +1414,42 @@ def test_check_coverage_counts_nulls_separately(session, settings, tmp_path):
     con.close()
     out = check_coverage(session, settings, path, "day")
     assert "4 NULL rows" in out
+
+
+def test_check_coverage_builds_only_the_gaps_it_shows(session, settings, tmp_path, monkeypatch):
+    """A scattered column is almost all gap, so the list is capped in SQL, not after.
+
+    Building it whole first is what makes this expensive: the totals below are
+    exact regardless, because they come from aggregates rather than from the
+    length of a list shipped into Python.
+    """
+    import duckdb
+
+    path = (tmp_path / "holes.parquet").as_posix()
+    con = duckdb.connect(":memory:")
+    # 100 consecutive values fix the step at 1; 60 spaced 100 apart then leave
+    # 60 gaps, comfortably past COVERAGE_MAX_ROWS.
+    con.execute(
+        f"COPY (SELECT i AS seq FROM range(100) t(i) "
+        f"UNION ALL SELECT 200 + i * 100 FROM range(60) t(i)) TO '{path}'"
+    )
+    con.close()
+
+    statements: list[str] = []
+    real = session.execute
+
+    def spy(sql, **kwargs):
+        statements.append(sql)
+        return real(sql, **kwargs)
+
+    monkeypatch.setattr(session, "execute", spy)
+    out = check_coverage(session, settings, path, "seq")
+
+    assert any(f"LIMIT {COVERAGE_MAX_ROWS}" in sql for sql in statements)
+    assert "**5,941 missing**" in out  # exact, though only 50 gaps were fetched
+    assert "across 60 gaps" in out
+    assert f"({COVERAGE_MAX_ROWS} of 60 gaps shown)" in out
+    assert body_rows(out) == COVERAGE_MAX_ROWS
 
 
 def test_join_across_formats(session, settings, data_dir):
